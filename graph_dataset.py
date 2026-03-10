@@ -162,7 +162,13 @@ class VulGraphDataset(Dataset):
                 cache_dir.mkdir(parents=True, exist_ok=True)
         
         super().__init__(root, transform, pre_transform, pre_filter, log)
-        
+
+        if not osp.exists(self.processed_paths[0]) and (self.encoder is None or self.tokenizer is None):
+            raise ValueError(
+                f"Processed dataset not found at {self.processed_paths[0]}, and encoder/tokenizer is missing. "
+                "Provide encoder+tokenizer for first-time dataset processing."
+            )
+
         if osp.exists(self.processed_paths[0]):
             self.data_list = torch.load(self.processed_paths[0])
         else:
@@ -379,6 +385,12 @@ class VulGraphDataset(Dataset):
         """
         特征提取：GraphCodeBERT + Slice Masking
         """
+        if self.encoder is None or self.tokenizer is None:
+            raise ValueError(
+                "encoder/tokenizer is required to build graph features. "
+                "Please pass both when constructing VulGraphDataset, or prepare processed data in advance."
+            )
+
         cache_name = f"graph_feat_target_{_id}"
         cachefp = utils.get_dir(utils.cache_dir() / "vul_graph_feat_target") / cache_name
 
