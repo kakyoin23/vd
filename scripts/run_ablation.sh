@@ -5,13 +5,11 @@ set -euo pipefail
 #   bash scripts/run_ablation.sh
 #   bash scripts/run_ablation.sh --quick
 #   bash scripts/run_ablation.sh --seeds 42,43,44
-#   bash scripts/run_ablation.sh --keep-raw-log
 
 QUICK=0
 SEEDS="42,43,44,45,46"
 CUDA_ID="0"
 OUT_ROOT="ablation_runs"
-KEEP_RAW_LOG=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -31,10 +29,6 @@ while [[ $# -gt 0 ]]; do
       OUT_ROOT="$2"
       shift 2
       ;;
-    --keep-raw-log)
-      KEEP_RAW_LOG=1
-      shift
-      ;;
     *)
       echo "Unknown arg: $1"
       exit 1
@@ -45,6 +39,7 @@ done
 IFS=',' read -r -a SEED_ARR <<< "$SEEDS"
 mkdir -p "$OUT_ROOT"
 
+# Common training config (edit here if needed)
 COMMON_ARGS=(
   --do_train --do_test
   --num_train_epochs 50
@@ -76,6 +71,8 @@ if [[ "$QUICK" -eq 1 ]]; then
   SEED_ARR=(42 43)
 fi
 
+# Experiment matrix
+# name|extra args
 EXPERIMENTS=(
   "BASE_RGCN|--gnn_model RGCN"
   "MODEL_GCN|--gnn_model GCN"
@@ -84,15 +81,6 @@ EXPERIMENTS=(
   "TRAIN_FOCAL|--gnn_model RGCN --use_focal --focal_gamma 2.0 --label_smoothing 0.0"
   "TRAIN_FIXED_THR|--gnn_model RGCN"
 )
-
-extract_metrics() {
-  local raw_log="$1"
-  awk '
-    /\*\*\*\*\* Test results \*\*\*\*\*/ {in_block=1; next}
-    in_block && /^  / {print; next}
-    in_block && !/^  / {in_block=0}
-  ' "$raw_log"
-}
 
 echo "[INFO] Seeds: ${SEED_ARR[*]}"
 echo "[INFO] Experiments: ${#EXPERIMENTS[@]}"
@@ -105,9 +93,11 @@ for seed in "${SEED_ARR[@]}"; do
     run_dir="$OUT_ROOT/${name}/seed_${seed}"
     mkdir -p "$run_dir"
 
+    # TRAIN_FIXED_THR ablation: disable auto threshold for this branch
     this_args=("${COMMON_ARGS[@]}")
     if [[ "$name" == "TRAIN_FIXED_THR" ]]; then
       filtered=()
+      skip_next=0
       for a in "${this_args[@]}"; do
         if [[ "$a" == "--auto_threshold" ]]; then
           continue
@@ -117,53 +107,24 @@ for seed in "${SEED_ARR[@]}"; do
       this_args=("${filtered[@]}" --decision_threshold 0.5)
     fi
 
-    result_log="$run_dir/result.log"
-    raw_log="$run_dir/raw.log"
-
+    log_file="$run_dir/run.log"
     cmd=(python main.py "${this_args[@]}" --seed "$seed")
+
     # shellcheck disable=SC2206
     extra_arr=($extra)
     cmd+=("${extra_arr[@]}")
 
-    start_ts=$(date '+%F %T')
-
     echo "[RUN] $name seed=$seed"
-
-    if "${cmd[@]}" > "$raw_log" 2>&1; then
-      end_ts=$(date '+%F %T')
-      {
-        echo "status: SUCCESS"
-        echo "experiment: $name"
-        echo "seed: $seed"
-        echo "start: $start_ts"
-        echo "end: $end_ts"
-        echo "command: ${cmd[*]}"
-        echo "metrics:"
-        extract_metrics "$raw_log" || true
-      } > "$result_log"
-      echo "[DONE] $name seed=$seed -> $result_log"
-      if [[ "$KEEP_RAW_LOG" -ne 1 ]]; then
-        rm -f "$raw_log"
-      fi
-    else
-      end_ts=$(date '+%F %T')
-      {
-        echo "status: FAILED"
-        echo "experiment: $name"
-        echo "seed: $seed"
-        echo "start: $start_ts"
-        echo "end: $end_ts"
-        echo "command: ${cmd[*]}"
-        echo "error_tail:"
-        tail -n 80 "$raw_log" || true
-      } > "$result_log"
-      echo "[FAIL] $name seed=$seed -> $result_log"
-      if [[ "$KEEP_RAW_LOG" -ne 1 ]]; then
-        rm -f "$raw_log"
-      fi
+    echo "[CMD] ${cmd[*]}" | tee "$log_file"
+    {
+      "${cmd[@]}"
+    } >> "$log_file" 2>&1 || {
+      echo "[FAIL] $name seed=$seed (see $log_file)"
       continue
-    fi
+    }
+
+    echo "[DONE] $name seed=$seed"
   done
 done
 
-echo "[INFO] All scheduled runs finished. Results under: $OUT_ROOT/*/seed_*/result.log"
+echo "[INFO] All scheduled runs finished. Logs under: $OUT_ROOT"

@@ -41,7 +41,7 @@ bash scripts/run_ablation.sh --seeds 42,43,44,45,46 --cuda_id 0 --out_root ablat
 ```
 
 输出日志目录：
-- `ablation_runs/<实验名>/seed_<seed>/result.log`
+- `ablation_runs/<实验名>/seed_<seed>/run.log`
 
 ## 4. 数据层消融实现建议
 
@@ -54,7 +54,7 @@ bash scripts/run_ablation.sh --seeds 42,43,44,45,46 --cuda_id 0 --out_root ablat
 
 ## 5. 结果汇总模板
 
-建议从 `result.log` 中提取测试指标并形成表格：
+建议从 `run.log` 中提取测试指标并形成表格：
 
 - 主指标：`binary_f1`
 - 次指标：`binary_precision`、`binary_recall`、`eval_acc`、`threshold`
