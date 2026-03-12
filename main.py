@@ -750,7 +750,7 @@ def main():
 
     # [关键修改] 增加了 Transformer 和 GatedGraphConv 选项
     parser.add_argument("--gnn_model", default="RGCN", type=str, 
-                       choices=["GCNConv", "GatedGraphConv", "GAT", "GATv2", "RGCN", "RGAT", "Transformer"], 
+                       choices=["GCN", "GCNConv", "GatedGraph", "GatedGraphConv", "GraphConv", "GAT", "GATv2", "RGCN", "RGAT", "Transformer"], 
                        help="GNN core.")
     
     parser.add_argument("--num_relations", default=20, type=int, help="Max edge types")     
@@ -862,7 +862,7 @@ def main():
 
     print("\n=== Model Diagnosis ===")
     sample_batch = next(iter(train_dataloader))
-    model_diagnosis(model, sample_batch, args.device)
+    model_diagnosis(model, args.device)
 
     if args.do_train:
         train(args, train_dataloader, valid_dataloader, test_dataloader, model)
