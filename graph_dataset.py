@@ -129,7 +129,9 @@ class VulGraphDataset(Dataset):
                  encoder = None, tokenizer = None, partition = None,
                  vulonly = False, sample = -1, splits = "default",
                  debug: bool = False,
-                 clear_cache: bool = False
+                 clear_cache: bool = False,
+                 mask_mode: str = "aligned",
+                 mask_seed: int = 42
                  ):
         os.makedirs(root, exist_ok=True)
         self.encoder = encoder
@@ -139,8 +141,13 @@ class VulGraphDataset(Dataset):
         self.sample = sample
         self.splits = splits
         self.debug = debug
-        self.id2filename = {} 
-        
+        self.id2filename = {}
+        self.mask_mode = mask_mode
+        self.mask_seed = mask_seed
+        valid_modes = {"aligned", "all_ones", "random"}
+        if self.mask_mode not in valid_modes:
+            raise ValueError(f"Unsupported mask_mode={self.mask_mode}. choose from {sorted(valid_modes)}")
+
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         if self.encoder:
@@ -176,7 +183,8 @@ class VulGraphDataset(Dataset):
             
     @property
     def processed_dir(self) -> str:
-        return osp.join(self.root, f'{self.partition}_processed_target')
+        suffix = '' if self.mask_mode == 'aligned' else f'_{self.mask_mode}'
+        return osp.join(self.root, f'{self.partition}_processed_target{suffix}')
     
     @property
     def processed_file_names(self) -> Union[str, List[str], Tuple]:
@@ -290,9 +298,17 @@ class VulGraphDataset(Dataset):
                 # 2. 获取切片掩码 (1维)
                 # feature_extraction 里已经算好了 slice_mask 列
                 if "slice_mask" in n.columns:
-                    x_mask = n["slice_mask"].values.reshape(-1, 1) # (N, 1)
+                    base_mask = n["slice_mask"].values.reshape(-1, 1) # (N, 1)
                 else:
-                    x_mask = np.ones((len(n), 1)) # 如果没算出来，默认全1
+                    base_mask = np.ones((len(n), 1)) # 如果没算出来，默认全1
+
+                if self.mask_mode == "all_ones":
+                    x_mask = np.ones((len(n), 1), dtype=np.float32)
+                elif self.mask_mode == "random":
+                    rng = np.random.RandomState(self.mask_seed + int(_id))
+                    x_mask = rng.binomial(1, 0.5, size=(len(n), 1)).astype(np.float32)
+                else:
+                    x_mask = base_mask.astype(np.float32)
 
                 # 3. 拼接 -> 769维
                 x_enhanced = np.concatenate([x_base, x_mask], axis=1)
