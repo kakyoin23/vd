@@ -59,8 +59,12 @@ class EnhancedDetector(nn.Module):
         # B. 切片掩码嵌入: 0/1 -> hidden_dim
         # 这将 Mask 视为一种状态，学习出对应的向量表示，避免被淹没
         self.slice_embedding = nn.Embedding(2, self.hidden_dim)
+
+        # C. [新增] Mask 门控：让切片掩码显式调节语义通道
+        self.mask_gate_proj = Linear(self.hidden_dim, self.hidden_dim)
+        self.mask_gate_bias = nn.Parameter(torch.zeros(self.hidden_dim))
         
-        # C. 融合后的归一化与激活
+        # D. 融合后的归一化与激活
         self.input_norm = nn.LayerNorm(self.hidden_dim)
         self.input_act = GELU()
         
@@ -155,10 +159,10 @@ class EnhancedDetector(nn.Module):
         # 2. 分别映射
         h_sem = self.sem_proj(sem_feat)        # [N, hidden]
         h_mask = self.slice_embedding(slice_mask_idx) # [N, hidden]
-        
-        # 3. 融合 (Add) + 归一化 + 激活
-        # 此时 Mask 的信息已经作为一个强特征叠加到了语义特征上
-        h = h_sem + h_mask
+
+        # 3. [新增] 门控融合：mask 不仅加偏置，还控制语义通道通过比例
+        gate = torch.sigmoid(self.mask_gate_proj(h_mask) + self.mask_gate_bias)
+        h = h_sem * gate + h_mask
         h = self.input_norm(h)
         h = self.input_act(h)
         
