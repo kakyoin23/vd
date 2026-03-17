@@ -16,6 +16,7 @@ from torch_geometric.utils import *
 import torch_scatter
 from torch_scatter import scatter_softmax
 from transformers import AdamW, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+from transformers import RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer
 from torch.cuda.amp import autocast, GradScaler  # AMP
 
 from models.vul_detector import EnhancedDetector, model_diagnosis
@@ -750,7 +751,7 @@ def main():
 
     # [关键修改] 增加了 Transformer 和 GatedGraphConv 选项
     parser.add_argument("--gnn_model", default="RGCN", type=str, 
-                       choices=["GCNConv", "GatedGraphConv", "GAT", "GATv2", "RGCN", "RGAT", "Transformer"], 
+                       choices=["GCN", "GCNConv", "GatedGraph", "GatedGraphConv", "GraphConv", "GAT", "GATv2", "RGCN", "RGAT", "Transformer"], 
                        help="GNN core.")
     
     parser.add_argument("--num_relations", default=20, type=int, help="Max edge types")     
@@ -830,6 +831,9 @@ def main():
     
     parser.add_argument("--graph_pooling", default="attn", type=str, choices=["mean", "sum", "max", "attn", "set2set", "unet"])
 
+    parser.add_argument("--mask_mode", default="aligned", type=str, choices=["aligned", "all_ones", "random"])
+    parser.add_argument("--mask_seed", default=42, type=int)
+
     args = parser.parse_args()
 
     device = torch.device("cuda:" + str(args.cuda_id) if torch.cuda.is_available() else "cpu")
@@ -844,16 +848,39 @@ def main():
     args.start_epoch = 0
     args.start_step = 0
 
+    def _dataset_processed_file(partition: str) -> str:
+        if args.mask_mode == "aligned":
+            suffix = ""
+        elif args.mask_mode == "random":
+            suffix = f"_random_{args.mask_seed}"
+        else:
+            suffix = f"_{args.mask_mode}"
+        return str(utils.processed_dir() / "vul_graph_dataset" / f"{partition}_processed_target{suffix}" / "data.pt")
+
+    encoder = None
+    tokenizer = None
+    needs_build = any(not os.path.exists(_dataset_processed_file(p)) for p in ["train", "val", "test"])
+    if needs_build:
+        model_name_or_path = str(utils.processed_dir() / "graphcodebert-base")
+        print(f"[info] processed graph dataset not found, loading encoder/tokenizer from: {model_name_or_path}")
+        config = RobertaConfig.from_pretrained(model_name_or_path, local_files_only=True)
+        tokenizer = RobertaTokenizer.from_pretrained(model_name_or_path, local_files_only=True)
+        encoder = RobertaForSequenceClassification.from_pretrained(
+            model_name_or_path,
+            config=config,
+            local_files_only=True,
+        )
+
     model = EnhancedDetector(args)
     model.to(args.device)
 
-    train_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='train')
+    train_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='train', mask_mode=args.mask_mode, mask_seed=args.mask_seed, encoder=encoder, tokenizer=tokenizer)
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate, num_workers=4, pin_memory=True)
     
-    valid_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='val')
+    valid_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='val', mask_mode=args.mask_mode, mask_seed=args.mask_seed, encoder=encoder, tokenizer=tokenizer)
     valid_dataloader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate, num_workers=4, pin_memory=True)
     
-    test_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='test')
+    test_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='test', mask_mode=args.mask_mode, mask_seed=args.mask_seed, encoder=encoder, tokenizer=tokenizer)
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate, num_workers=4, pin_memory=True)
 
     check_dataset_stats(train_dataloader, "Training")
@@ -862,7 +889,7 @@ def main():
 
     print("\n=== Model Diagnosis ===")
     sample_batch = next(iter(train_dataloader))
-    model_diagnosis(model, sample_batch, args.device)
+    model_diagnosis(model, args.device)
 
     if args.do_train:
         train(args, train_dataloader, valid_dataloader, test_dataloader, model)
