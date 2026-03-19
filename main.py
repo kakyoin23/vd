@@ -674,11 +674,24 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
         try:
             # GNNExplainer 默认只处理 x, edge_index
             # edge_attr 和 edge_types 是在 model forward 中使用的，Explainer 会优化 mask
-            edge_masks = explainer(x, edge_index)
+            target_label = torch.argmax(prob, dim=-1).detach()
+            edge_masks = explainer(
+                x,
+                edge_index,
+                batch=batch,
+                edge_attr=edge_attr,
+                edge_types=edge_type,
+                num_classes=args.num_classes,
+                target_label=target_label,
+            )
             if isinstance(edge_masks, tuple): edge_mask = edge_masks[0]
             else: edge_mask = edge_masks
-            
-            edge_weight = edge_mask[torch.argmax(exp_prob_label, dim=-1)]
+
+            if isinstance(edge_mask, (list, tuple)):
+                pred_idx = int(torch.argmax(exp_prob_label, dim=-1).item())
+                edge_weight = edge_mask[0] if len(edge_mask) == 1 else edge_mask[pred_idx]
+            else:
+                edge_weight = edge_mask
             graph.__setitem__("edge_weight", torch.Tensor(edge_weight.detach().cpu()))
             graph.__setitem__("pred", exp_prob_label[0][args.positive_class_id])
             graph_exp_list.append(graph.detach().clone().cpu())
@@ -917,7 +930,12 @@ def main():
     if args.do_test:
         checkpoint_prefix = 'checkpoint-best-f1/model.bin'
         model_checkpoint_dir = os.path.join(args.model_checkpoint_dir, '{}'.format(checkpoint_prefix))
-        load_checkpoint_strict(model, model_checkpoint_dir, args.device)
+        checkpoint_state = torch.load(model_checkpoint_dir, map_location=args.device)
+        load_result = model.load_state_dict(checkpoint_state, strict=False)
+        if load_result.missing_keys:
+            print(f"[warn] checkpoint missing keys, using current model defaults: {load_result.missing_keys}")
+        if load_result.unexpected_keys:
+            print(f"[warn] checkpoint has unexpected keys that were ignored: {load_result.unexpected_keys}")
         model.to(args.device)
 
         if getattr(args, "calibrate_temp", False):

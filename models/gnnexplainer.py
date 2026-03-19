@@ -330,8 +330,22 @@ class GATEnhancedGNNExplainer(ExplainerBase):
             self.__set_masks__(x, self_loop_edge_index)
         else:
             # Calculate masks for all classes
-            labels = tuple(i for i in range(kwargs.get('num_classes')))
-            ex_labels = tuple(torch.tensor([label]).to(self.device) for label in labels)
+            num_classes = kwargs.get('num_classes')
+            if num_classes is None:
+                num_classes = getattr(self.model, 'num_classes', None)
+
+            if target_label is not None:
+                if isinstance(target_label, torch.Tensor):
+                    ex_labels = (target_label.to(self.device).view(-1)[0:1],)
+                else:
+                    ex_labels = (torch.tensor([int(target_label)], device=self.device),)
+            else:
+                if num_classes is None:
+                    raise ValueError(
+                        "num_classes is required for GNNExplainer when target_label is not provided."
+                    )
+                labels = tuple(i for i in range(num_classes))
+                ex_labels = tuple(torch.tensor([label]).to(self.device) for label in labels)
 
             edge_masks = []
             for ex_label in ex_labels:
