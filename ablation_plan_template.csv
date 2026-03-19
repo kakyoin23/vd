@@ -1,0 +1,10 @@
+exp_id,group,variant,seed,gnn_model,mask_mode,use_focal,focal_gamma,class_weight_gamma,label_smoothing,auto_threshold,calibrate_temp,batch_size,learning_rate,num_train_epochs,gradient_accumulation_steps,graph_pooling,residual,notes,status
+A0_BASE_RGCN,baseline,full_method,42,RGCN,aligned,0,,1.0,0.05,1,1,32,5e-4,50,2,attn,1,"baseline single run",pending
+A1_DATA_NO_MASK,data_ablation,no_mask_all_ones,42,RGCN,all_ones,0,,1.0,0.05,1,1,32,5e-4,50,2,attn,1,"remove slice signal",pending
+A2_DATA_RANDOM_MASK,data_ablation,random_mask,42,RGCN,random,0,,1.0,0.05,1,1,32,5e-4,50,2,attn,1,"randomized slice mask",pending
+B1_MODEL_GCN,model_ablation,gcn_backbone,42,GCN,aligned,0,,1.0,0.05,1,1,32,5e-4,50,2,attn,1,"backbone compare",pending
+B2_MODEL_GAT,model_ablation,gat_backbone,42,GAT,aligned,0,,1.0,0.05,1,1,32,5e-4,50,2,attn,1,"backbone compare",pending
+B3_MODEL_GRAPHCONV,model_ablation,graphconv_backbone,42,GraphConv,aligned,0,,1.0,0.05,1,1,32,5e-4,50,2,attn,1,"backbone compare",pending
+C1_TRAIN_FOCAL,train_ablation,focal_loss,42,RGCN,aligned,1,2.0,1.0,0.0,1,1,32,5e-4,50,2,attn,1,"loss ablation",pending
+C2_TRAIN_NO_AUTO_THR,train_ablation,fixed_threshold_0.5,42,RGCN,aligned,0,,1.0,0.05,0,1,32,5e-4,50,2,attn,1,"threshold strategy",pending
+R_MULTI_SEED,robustness,multi_seed_report,"42|43|44|45|46",RGCN,aligned,0,,1.0,0.05,1,1,32,5e-4,50,2,attn,1,"report mean/std",pending
