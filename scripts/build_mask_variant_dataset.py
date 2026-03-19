@@ -7,7 +7,10 @@ def convert_partition(root: Path, partition: str, mask_mode: str, seed: int = 42
     src = root / f"{partition}_processed_target" / "data.pt"
     if mask_mode == "aligned":
         raise ValueError("aligned does not need conversion")
-    dst = root / f"{partition}_processed_target_{mask_mode}" / "data.pt"
+    if mask_mode == "random":
+        dst = root / f"{partition}_processed_target_{mask_mode}_{seed}" / "data.pt"
+    else:
+        dst = root / f"{partition}_processed_target_{mask_mode}" / "data.pt"
 
     if not src.exists():
         raise FileNotFoundError(f"source dataset not found: {src}")

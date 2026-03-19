@@ -183,7 +183,13 @@ class VulGraphDataset(Dataset):
             
     @property
     def processed_dir(self) -> str:
-        suffix = '' if self.mask_mode == 'aligned' else f'_{self.mask_mode}'
+        if self.mask_mode == 'aligned':
+            suffix = ''
+        elif self.mask_mode == 'random':
+            # random mask 受 seed 影响，避免不同 seed 共用同一份缓存
+            suffix = f'_{self.mask_mode}_{self.mask_seed}'
+        else:
+            suffix = f'_{self.mask_mode}'
         return osp.join(self.root, f'{self.partition}_processed_target{suffix}')
     
     @property
