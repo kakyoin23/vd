@@ -632,6 +632,7 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
     explainer.device = args.device
 
     for graph in test_dataset:
+        explainer.__clear_masks__()
         graph.to(args.device)
         x, edge_index, batch = graph.x, graph.edge_index.long(), graph.batch
         
@@ -698,6 +699,7 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
             visited_sampleids.add(sampleid)
         except Exception as e:
             print(f"Error processing {sampleid}: {e}")
+            explainer.__clear_masks__()
             continue
 
     return graph_exp_list

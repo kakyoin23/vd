@@ -306,90 +306,92 @@ class GATEnhancedGNNExplainer(ExplainerBase):
         """
         super().forward(x=x, edge_index=edge_index, **kwargs)
         self.model.eval()
-
-        # Handle self-loops based on GAT configuration
-        add_self_loops_for_explainer = True
-        if self._is_gat_model:
-            for module in self.model.modules():
-                if isinstance(module, GATConv) and not module.add_self_loops:
-                    add_self_loops_for_explainer = False
-                    break
-
-        if self.explain_graph:
-            # 图分类解释必须与真实 forward 使用同一条 edge_index，
-            # 否则 heterogeneous edge_types 与 edge_mask 长度会失配。
-            self_loop_edge_index = edge_index
-        elif add_self_loops_for_explainer:
-            self_loop_edge_index, _ = add_remaining_self_loops(edge_index, num_nodes=self.num_nodes)
-        else:
-            self_loop_edge_index = edge_index
-
-        # Only operate on a k-hop subgraph around `node_idx` for node classification
-        if not self.explain_graph:
-            self.node_idx = node_idx = kwargs.get('node_idx')
-            assert node_idx is not None, 'An node explanation needs kwarg node_idx, but got None.'
-            if isinstance(node_idx, torch.Tensor) and not node_idx.dim():
-                node_idx = node_idx.to(self.device).flatten()
-            elif isinstance(node_idx, (int, list, tuple)):
-                node_idx = torch.tensor([node_idx], device=self.device, dtype=torch.int64).flatten()
-            else:
-                raise TypeError(f'node_idx should be in types of int, list, tuple, '
-                                f'or torch.Tensor, but got {type(node_idx)}')
-            self.subset, _, _, self.hard_edge_mask = subgraph(
-                node_idx, self.__num_hops__, self_loop_edge_index, relabel_nodes=True,
-                num_nodes=None, flow=self.__flow__())
-            self.new_node_idx = torch.where(self.subset == node_idx)[0]
-
-        if kwargs.get('edge_masks'):
-            edge_masks = kwargs.pop('edge_masks')
-            self.__set_masks__(x, self_loop_edge_index)
-        else:
-            # Calculate masks for all classes
-            num_classes = kwargs.get('num_classes')
-            if num_classes is None:
-                num_classes = getattr(self.model, 'num_classes', None)
-
-            if target_label is not None:
-                if isinstance(target_label, torch.Tensor):
-                    ex_labels = (target_label.to(self.device).view(-1)[0:1],)
-                else:
-                    ex_labels = (torch.tensor([int(target_label)], device=self.device),)
-            else:
-                if num_classes is None:
-                    raise ValueError(
-                        "num_classes is required for GNNExplainer when target_label is not provided."
-                    )
-                labels = tuple(i for i in range(num_classes))
-                ex_labels = tuple(torch.tensor([label]).to(self.device) for label in labels)
-
-            edge_masks = []
-            for ex_label in ex_labels:
-                if target_label is None or ex_label.item() == target_label.item():
-                    self.__clear_masks__()
-                    self.__set_masks__(x, self_loop_edge_index)
-                    edge_mask = self.gnn_explainer_alg(x, edge_index, ex_label, mask_features, **kwargs).sigmoid()
-                    
-                    if self._symmetric_edge_mask_indirect_graph:
-                        edge_mask = symmetric_edge_mask_indirect_graph(self_loop_edge_index, edge_mask)
-
-                    edge_masks.append(edge_mask)
-
-        # Convert soft masks to hard masks based on sparsity
-        hard_edge_masks = [self.control_sparsity(mask, sparsity=kwargs.get('sparsity'))
-                           for mask in edge_masks]
-
-        # Evaluate explanations
-        with torch.no_grad():
-            related_preds = self.eval_related_pred(
-                x,
-                edge_index,
-                hard_edge_masks,
-                **self._model_forward_kwargs(kwargs),
-            )
-
         self.__clear_masks__()
 
-        return edge_masks, hard_edge_masks, related_preds, self_loop_edge_index
+        try:
+            # Handle self-loops based on GAT configuration
+            add_self_loops_for_explainer = True
+            if self._is_gat_model:
+                for module in self.model.modules():
+                    if isinstance(module, GATConv) and not module.add_self_loops:
+                        add_self_loops_for_explainer = False
+                        break
+
+            if self.explain_graph:
+                # 图分类解释必须与真实 forward 使用同一条 edge_index，
+                # 否则 heterogeneous edge_types 与 edge_mask 长度会失配。
+                self_loop_edge_index = edge_index
+            elif add_self_loops_for_explainer:
+                self_loop_edge_index, _ = add_remaining_self_loops(edge_index, num_nodes=self.num_nodes)
+            else:
+                self_loop_edge_index = edge_index
+
+            # Only operate on a k-hop subgraph around `node_idx` for node classification
+            if not self.explain_graph:
+                self.node_idx = node_idx = kwargs.get('node_idx')
+                assert node_idx is not None, 'An node explanation needs kwarg node_idx, but got None.'
+                if isinstance(node_idx, torch.Tensor) and not node_idx.dim():
+                    node_idx = node_idx.to(self.device).flatten()
+                elif isinstance(node_idx, (int, list, tuple)):
+                    node_idx = torch.tensor([node_idx], device=self.device, dtype=torch.int64).flatten()
+                else:
+                    raise TypeError(f'node_idx should be in types of int, list, tuple, '
+                                    f'or torch.Tensor, but got {type(node_idx)}')
+                self.subset, _, _, self.hard_edge_mask = subgraph(
+                    node_idx, self.__num_hops__, self_loop_edge_index, relabel_nodes=True,
+                    num_nodes=None, flow=self.__flow__())
+                self.new_node_idx = torch.where(self.subset == node_idx)[0]
+
+            if kwargs.get('edge_masks'):
+                edge_masks = kwargs.pop('edge_masks')
+                self.__set_masks__(x, self_loop_edge_index)
+            else:
+                # Calculate masks for all classes
+                num_classes = kwargs.get('num_classes')
+                if num_classes is None:
+                    num_classes = getattr(self.model, 'num_classes', None)
+
+                if target_label is not None:
+                    if isinstance(target_label, torch.Tensor):
+                        ex_labels = (target_label.to(self.device).view(-1)[0:1],)
+                    else:
+                        ex_labels = (torch.tensor([int(target_label)], device=self.device),)
+                else:
+                    if num_classes is None:
+                        raise ValueError(
+                            "num_classes is required for GNNExplainer when target_label is not provided."
+                        )
+                    labels = tuple(i for i in range(num_classes))
+                    ex_labels = tuple(torch.tensor([label]).to(self.device) for label in labels)
+
+                edge_masks = []
+                for ex_label in ex_labels:
+                    if target_label is None or ex_label.item() == target_label.item():
+                        self.__clear_masks__()
+                        self.__set_masks__(x, self_loop_edge_index)
+                        edge_mask = self.gnn_explainer_alg(x, edge_index, ex_label, mask_features, **kwargs).sigmoid()
+                        
+                        if self._symmetric_edge_mask_indirect_graph:
+                            edge_mask = symmetric_edge_mask_indirect_graph(self_loop_edge_index, edge_mask)
+
+                        edge_masks.append(edge_mask)
+
+            # Convert soft masks to hard masks based on sparsity
+            hard_edge_masks = [self.control_sparsity(mask, sparsity=kwargs.get('sparsity'))
+                               for mask in edge_masks]
+
+            # Evaluate explanations
+            with torch.no_grad():
+                related_preds = self.eval_related_pred(
+                    x,
+                    edge_index,
+                    hard_edge_masks,
+                    **self._model_forward_kwargs(kwargs),
+                )
+
+            return edge_masks, hard_edge_masks, related_preds, self_loop_edge_index
+        finally:
+            self.__clear_masks__()
 
     def __repr__(self):
         return f'{self.__class__.__name__}(gat_optimized={self._is_gat_model})'
