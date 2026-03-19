@@ -484,6 +484,18 @@ def gen_exp_lines(edge_index, edge_weight, index, num_nodes, lines):
     filtered_ret = [int(i[1]) for i in ret if i[0] > 0]
     return filtered_ret
 
+def load_checkpoint_strict(model, checkpoint_path, device):
+    checkpoint_state = torch.load(checkpoint_path, map_location=device)
+    try:
+        model.load_state_dict(checkpoint_state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Checkpoint at {} is incompatible with the current model architecture. "
+            "Refusing to evaluate with partially loaded weights; please use a matching checkpoint or retrain the model. "
+            "Original error: {}".format(checkpoint_path, exc)
+        ) from exc
+
+
 def eval_exp(exp_saved_path, model, correct_lines, args):
     graph_exp_list = torch.load(exp_saved_path, map_location=args.device)
     print("Number of explanations:", len(graph_exp_list))
@@ -905,12 +917,7 @@ def main():
     if args.do_test:
         checkpoint_prefix = 'checkpoint-best-f1/model.bin'
         model_checkpoint_dir = os.path.join(args.model_checkpoint_dir, '{}'.format(checkpoint_prefix))
-        checkpoint_state = torch.load(model_checkpoint_dir, map_location=args.device)
-        load_result = model.load_state_dict(checkpoint_state, strict=False)
-        if load_result.missing_keys:
-            print(f"[warn] checkpoint missing keys, using current model defaults: {load_result.missing_keys}")
-        if load_result.unexpected_keys:
-            print(f"[warn] checkpoint has unexpected keys that were ignored: {load_result.unexpected_keys}")
+        load_checkpoint_strict(model, model_checkpoint_dir, args.device)
         model.to(args.device)
 
         if getattr(args, "calibrate_temp", False):

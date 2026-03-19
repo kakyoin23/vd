@@ -90,7 +90,7 @@ class EnhancedDetector(nn.Module):
         elif self.gnn_model == 'Transformer':
             self.conv1 = TransformerConv(self.hidden_dim, self.hidden_dim // args.num_heads, heads=args.num_heads, edge_dim=args.num_relations if args.residual else None)
         elif self.gnn_model in ['RGCN', 'RGAT']:
-            self.conv1 = RGCNConv(self.hidden_dim, self.hidden_dim, num_relations=args.num_relations)
+            self.conv1 = self._build_relational_conv(self.gnn_model)
         else:
             raise ValueError(f"Unsupported GNN model: {args.gnn_model}")
 
@@ -108,7 +108,7 @@ class EnhancedDetector(nn.Module):
             elif self.gnn_model == 'Transformer':
                 self.conv2 = TransformerConv(self.hidden_dim, self.hidden_dim // args.num_heads, heads=args.num_heads)
             elif self.gnn_model in ['RGCN', 'RGAT']:
-                self.conv2 = RGCNConv(self.hidden_dim, self.hidden_dim, num_relations=args.num_relations)
+                self.conv2 = self._build_relational_conv(self.gnn_model)
 
         # 图池化层
         if args.graph_pooling == "sum":
@@ -141,6 +141,13 @@ class EnhancedDetector(nn.Module):
             'RGAT': 'RGAT',
         }
         return alias.get(name, name)
+
+    def _build_relational_conv(self, model_name: str):
+        if model_name == 'RGCN':
+            return RGCNConv(self.hidden_dim, self.hidden_dim, num_relations=self.args.num_relations)
+        if model_name == 'RGAT':
+            return RGATConv(self.hidden_dim, self.hidden_dim, num_relations=self.args.num_relations)
+        raise ValueError(f"Unsupported relational GNN model: {model_name}")
 
 
     def forward(self, x, edge_index, batch=None, edge_attr=None, edge_types=None):
