@@ -44,6 +44,7 @@ class EnhancedDetector(nn.Module):
         super(EnhancedDetector, self).__init__()
         self.args = args
         self.num_classes = args.num_classes
+        self.gnn_model = self._normalize_gnn_model(args.gnn_model)
         
         # ------------------------------------------------------------------
         # [修改点 1] 输入层改造：分离语义特征与切片掩码
@@ -58,8 +59,12 @@ class EnhancedDetector(nn.Module):
         # B. 切片掩码嵌入: 0/1 -> hidden_dim
         # 这将 Mask 视为一种状态，学习出对应的向量表示，避免被淹没
         self.slice_embedding = nn.Embedding(2, self.hidden_dim)
+
+        # C. [新增] Mask 门控：让切片掩码显式调节语义通道
+        self.mask_gate_proj = Linear(self.hidden_dim, self.hidden_dim)
+        self.mask_gate_bias = nn.Parameter(torch.zeros(self.hidden_dim))
         
-        # C. 融合后的归一化与激活
+        # D. 融合后的归一化与激活
         self.input_norm = nn.LayerNorm(self.hidden_dim)
         self.input_act = GELU()
         
@@ -73,18 +78,18 @@ class EnhancedDetector(nn.Module):
         self.act = GELU()
         
         # 第一层 GNN
-        if args.gnn_model == 'GCN':
+        if self.gnn_model == 'GCN':
             self.conv1 = GCNConv(self.hidden_dim, self.hidden_dim)
-        elif args.gnn_model == 'GAT':
+        elif self.gnn_model == 'GAT':
              # GATv2通常比GAT更强
             self.conv1 = GATv2Conv(self.hidden_dim, self.hidden_dim // args.num_heads, heads=args.num_heads)
-        elif args.gnn_model == 'GraphConv':
+        elif self.gnn_model == 'GraphConv':
             self.conv1 = GraphConv(self.hidden_dim, self.hidden_dim)
-        elif args.gnn_model == 'GatedGraph':
+        elif self.gnn_model == 'GatedGraph':
             self.conv1 = GatedGraphConv(self.hidden_dim, num_layers=args.num_ggnn_steps)
-        elif args.gnn_model == 'Transformer':
+        elif self.gnn_model == 'Transformer':
             self.conv1 = TransformerConv(self.hidden_dim, self.hidden_dim // args.num_heads, heads=args.num_heads, edge_dim=args.num_relations if args.residual else None)
-        elif args.gnn_model == 'RGCN':
+        elif self.gnn_model in ['RGCN', 'RGAT']:
             self.conv1 = RGCNConv(self.hidden_dim, self.hidden_dim, num_relations=args.num_relations)
         else:
             raise ValueError(f"Unsupported GNN model: {args.gnn_model}")
@@ -92,17 +97,17 @@ class EnhancedDetector(nn.Module):
         # 残差连接或第二层
         self.conv2 = None
         if args.num_gnn_layers >= 2:
-            if args.gnn_model == 'GCN':
+            if self.gnn_model == 'GCN':
                 self.conv2 = GCNConv(self.hidden_dim, self.hidden_dim)
-            elif args.gnn_model == 'GAT':
+            elif self.gnn_model == 'GAT':
                 self.conv2 = GATv2Conv(self.hidden_dim, self.hidden_dim // args.num_heads, heads=args.num_heads)
-            elif args.gnn_model == 'GraphConv':
+            elif self.gnn_model == 'GraphConv':
                 self.conv2 = GraphConv(self.hidden_dim, self.hidden_dim)
-            elif args.gnn_model == 'GatedGraph':
+            elif self.gnn_model == 'GatedGraph':
                 pass # GGNN 自身就是多步的
-            elif args.gnn_model == 'Transformer':
+            elif self.gnn_model == 'Transformer':
                 self.conv2 = TransformerConv(self.hidden_dim, self.hidden_dim // args.num_heads, heads=args.num_heads)
-            elif args.gnn_model == 'RGCN':
+            elif self.gnn_model in ['RGCN', 'RGAT']:
                 self.conv2 = RGCNConv(self.hidden_dim, self.hidden_dim, num_relations=args.num_relations)
 
         # 图池化层
@@ -127,8 +132,18 @@ class EnhancedDetector(nn.Module):
         
         print(f"[Model Init] Mode: Slice-Embedding Enhanced | Backbone: {args.gnn_model}")
 
+    @staticmethod
+    def _normalize_gnn_model(name: str) -> str:
+        alias = {
+            'GCNConv': 'GCN',
+            'GatedGraphConv': 'GatedGraph',
+            'GATv2': 'GAT',
+            'RGAT': 'RGAT',
+        }
+        return alias.get(name, name)
 
-    def forward(self, x, edge_index, batch=None, edge_attr=None):
+
+    def forward(self, x, edge_index, batch=None, edge_attr=None, edge_types=None):
         # =========================================================
         # [修改点 2] 前向传播逻辑：特征融合
         # =========================================================
@@ -144,10 +159,10 @@ class EnhancedDetector(nn.Module):
         # 2. 分别映射
         h_sem = self.sem_proj(sem_feat)        # [N, hidden]
         h_mask = self.slice_embedding(slice_mask_idx) # [N, hidden]
-        
-        # 3. 融合 (Add) + 归一化 + 激活
-        # 此时 Mask 的信息已经作为一个强特征叠加到了语义特征上
-        h = h_sem + h_mask
+
+        # 3. [新增] 门控融合：mask 不仅加偏置，还控制语义通道通过比例
+        gate = torch.sigmoid(self.mask_gate_proj(h_mask) + self.mask_gate_bias)
+        h = h_sem * gate + h_mask
         h = self.input_norm(h)
         h = self.input_act(h)
         
@@ -156,17 +171,15 @@ class EnhancedDetector(nn.Module):
         # =========================================================
         
         # GNN Layer 1
-        if self.args.gnn_model == 'Transformer':
-            # TransformerConv 支持 edge_attr 但具体看实现，这里简化处理
-            h_gnn = self.conv1(h, edge_index) 
-        elif self.args.gnn_model == 'RGCN':
-             # RGCN 需要 edge_type，这里假设 edge_attr 是 type 索引
-             # 注意：dataset 中 edge_attr 需要是 long 类型
-            if edge_attr is not None:
-                h_gnn = self.conv1(h, edge_index, edge_attr)
+        if self.gnn_model == 'Transformer':
+            h_gnn = self.conv1(h, edge_index, edge_attr=edge_attr)
+        elif self.gnn_model in ['RGCN', 'RGAT']:
+            rel_types = edge_types if edge_types is not None else edge_attr
+            if rel_types is None:
+                rel_types = torch.zeros(edge_index.size(1), dtype=torch.long, device=x.device)
             else:
-                 # 如果没有边类型，RGCN 可能会报错，需确保数据处理正确
-                h_gnn = self.conv1(h, edge_index, torch.zeros(edge_index.size(1)).long().to(x.device))
+                rel_types = rel_types.long()
+            h_gnn = self.conv1(h, edge_index, rel_types)
         else:
             h_gnn = self.conv1(h, edge_index)
 
@@ -178,10 +191,15 @@ class EnhancedDetector(nn.Module):
             if self.args.residual:
                 identity = h
             
-            if self.args.gnn_model == 'RGCN' and edge_attr is not None:
-                h_new = self.conv2(h, edge_index, edge_attr)
-            elif self.args.gnn_model == 'RGCN':
-                h_new = self.conv2(h, edge_index, torch.zeros(edge_index.size(1)).long().to(x.device))
+            if self.gnn_model in ['RGCN', 'RGAT']:
+                rel_types = edge_types if edge_types is not None else edge_attr
+                if rel_types is None:
+                    rel_types = torch.zeros(edge_index.size(1), dtype=torch.long, device=x.device)
+                else:
+                    rel_types = rel_types.long()
+                h_new = self.conv2(h, edge_index, rel_types)
+            elif self.gnn_model == 'Transformer':
+                h_new = self.conv2(h, edge_index, edge_attr=edge_attr)
             else:
                 h_new = self.conv2(h, edge_index)
             

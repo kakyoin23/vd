@@ -16,6 +16,7 @@ from torch_geometric.utils import *
 import torch_scatter
 from torch_scatter import scatter_softmax
 from transformers import AdamW, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
+from transformers import RobertaConfig, RobertaForSequenceClassification, RobertaTokenizer
 from torch.cuda.amp import autocast, GradScaler  # AMP
 
 from models.vul_detector import EnhancedDetector, model_diagnosis
@@ -486,6 +487,14 @@ def gen_exp_lines(edge_index, edge_weight, index, num_nodes, lines):
 def eval_exp(exp_saved_path, model, correct_lines, args):
     graph_exp_list = torch.load(exp_saved_path, map_location=args.device)
     print("Number of explanations:", len(graph_exp_list))
+    if len(graph_exp_list) == 0:
+        print("[warn] explanation cache is empty; skip explanation metrics.")
+        print("Accuracy:", 0.0)
+        print("Precision:", 0.0)
+        print("Recall:", 0.0)
+        print("F1:", 0.0)
+        print("Probability of Necessity:", 0.0)
+        return
 
     accuracy_cnt = 0
     precisions, recalls, F1s, pn = [], [], [], []
@@ -653,11 +662,24 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
         try:
             # GNNExplainer 默认只处理 x, edge_index
             # edge_attr 和 edge_types 是在 model forward 中使用的，Explainer 会优化 mask
-            edge_masks = explainer(x, edge_index)
+            target_label = torch.argmax(prob, dim=-1).detach()
+            edge_masks = explainer(
+                x,
+                edge_index,
+                batch=batch,
+                edge_attr=edge_attr,
+                edge_types=edge_type,
+                num_classes=args.num_classes,
+                target_label=target_label,
+            )
             if isinstance(edge_masks, tuple): edge_mask = edge_masks[0]
             else: edge_mask = edge_masks
-            
-            edge_weight = edge_mask[torch.argmax(exp_prob_label, dim=-1)]
+
+            if isinstance(edge_mask, (list, tuple)):
+                pred_idx = int(torch.argmax(exp_prob_label, dim=-1).item())
+                edge_weight = edge_mask[0] if len(edge_mask) == 1 else edge_mask[pred_idx]
+            else:
+                edge_weight = edge_mask
             graph.__setitem__("edge_weight", torch.Tensor(edge_weight.detach().cpu()))
             graph.__setitem__("pred", exp_prob_label[0][args.positive_class_id])
             graph_exp_list.append(graph.detach().clone().cpu())
@@ -750,7 +772,7 @@ def main():
 
     # [关键修改] 增加了 Transformer 和 GatedGraphConv 选项
     parser.add_argument("--gnn_model", default="RGCN", type=str, 
-                       choices=["GCNConv", "GatedGraphConv", "GAT", "GATv2", "RGCN", "RGAT", "Transformer"], 
+                       choices=["GCN", "GCNConv", "GatedGraph", "GatedGraphConv", "GraphConv", "GAT", "GATv2", "RGCN", "RGAT", "Transformer"], 
                        help="GNN core.")
     
     parser.add_argument("--num_relations", default=20, type=int, help="Max edge types")     
@@ -830,6 +852,9 @@ def main():
     
     parser.add_argument("--graph_pooling", default="attn", type=str, choices=["mean", "sum", "max", "attn", "set2set", "unet"])
 
+    parser.add_argument("--mask_mode", default="aligned", type=str, choices=["aligned", "all_ones", "random"])
+    parser.add_argument("--mask_seed", default=42, type=int)
+
     args = parser.parse_args()
 
     device = torch.device("cuda:" + str(args.cuda_id) if torch.cuda.is_available() else "cpu")
@@ -844,16 +869,39 @@ def main():
     args.start_epoch = 0
     args.start_step = 0
 
+    def _dataset_processed_file(partition: str) -> str:
+        if args.mask_mode == "aligned":
+            suffix = ""
+        elif args.mask_mode == "random":
+            suffix = f"_random_{args.mask_seed}"
+        else:
+            suffix = f"_{args.mask_mode}"
+        return str(utils.processed_dir() / "vul_graph_dataset" / f"{partition}_processed_target{suffix}" / "data.pt")
+
+    encoder = None
+    tokenizer = None
+    needs_build = any(not os.path.exists(_dataset_processed_file(p)) for p in ["train", "val", "test"])
+    if needs_build:
+        model_name_or_path = str(utils.processed_dir() / "graphcodebert-base")
+        print(f"[info] processed graph dataset not found, loading encoder/tokenizer from: {model_name_or_path}")
+        config = RobertaConfig.from_pretrained(model_name_or_path, local_files_only=True)
+        tokenizer = RobertaTokenizer.from_pretrained(model_name_or_path, local_files_only=True)
+        encoder = RobertaForSequenceClassification.from_pretrained(
+            model_name_or_path,
+            config=config,
+            local_files_only=True,
+        )
+
     model = EnhancedDetector(args)
     model.to(args.device)
 
-    train_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='train')
+    train_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='train', mask_mode=args.mask_mode, mask_seed=args.mask_seed, encoder=encoder, tokenizer=tokenizer)
     train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate, num_workers=4, pin_memory=True)
     
-    valid_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='val')
+    valid_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='val', mask_mode=args.mask_mode, mask_seed=args.mask_seed, encoder=encoder, tokenizer=tokenizer)
     valid_dataloader = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate, num_workers=4, pin_memory=True)
     
-    test_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='test')
+    test_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='test', mask_mode=args.mask_mode, mask_seed=args.mask_seed, encoder=encoder, tokenizer=tokenizer)
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate, num_workers=4, pin_memory=True)
 
     check_dataset_stats(train_dataloader, "Training")
@@ -862,7 +910,7 @@ def main():
 
     print("\n=== Model Diagnosis ===")
     sample_batch = next(iter(train_dataloader))
-    model_diagnosis(model, sample_batch, args.device)
+    model_diagnosis(model, args.device)
 
     if args.do_train:
         train(args, train_dataloader, valid_dataloader, test_dataloader, model)
@@ -870,7 +918,12 @@ def main():
     if args.do_test:
         checkpoint_prefix = 'checkpoint-best-f1/model.bin'
         model_checkpoint_dir = os.path.join(args.model_checkpoint_dir, '{}'.format(checkpoint_prefix))
-        model.load_state_dict(torch.load(model_checkpoint_dir, map_location=args.device))
+        checkpoint_state = torch.load(model_checkpoint_dir, map_location=args.device)
+        load_result = model.load_state_dict(checkpoint_state, strict=False)
+        if load_result.missing_keys:
+            print(f"[warn] checkpoint missing keys, using current model defaults: {load_result.missing_keys}")
+        if load_result.unexpected_keys:
+            print(f"[warn] checkpoint has unexpected keys that were ignored: {load_result.unexpected_keys}")
         model.to(args.device)
 
         if getattr(args, "calibrate_temp", False):
@@ -904,6 +957,10 @@ def main():
             for p in model.parameters(): p.requires_grad = False
 
             need_recompute = args.overwrite_explain or args.ipt_update or (not os.path.isfile(ipt_save))
+            if (not need_recompute) and os.path.isfile(ipt_save):
+                if len(torch.load(ipt_save, map_location="cpu")) == 0:
+                    print(f"[warn] cached explanation file is empty, recomputing: {ipt_save}")
+                    need_recompute = True
             if need_recompute:
                 print(f"[explain] recompute -> {ipt_save}")
                 if args.ipt_method == "gnnexplainer":

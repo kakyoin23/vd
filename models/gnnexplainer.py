@@ -112,10 +112,17 @@ class GATEnhancedGNNExplainer(ExplainerBase):
         
         # Perform forward pass to capture attention weights
         with torch.no_grad():
-            _ = self.model(x, edge_index, **kwargs)
+            _ = self.model(x, edge_index, **self._model_forward_kwargs(kwargs))
         
         self._remove_attention_hooks()
         return self.gat_attention_weights
+
+    @staticmethod
+    def _model_forward_kwargs(kwargs):
+        model_kwargs = dict(kwargs)
+        for key in ["num_classes", "sparsity", "edge_masks", "node_idx"]:
+            model_kwargs.pop(key, None)
+        return model_kwargs
 
     def __set_masks__(self, x: Tensor, edge_index: Tensor, init: str = "normal"):
         (N, F), E = x.size(), edge_index.size(1)
@@ -253,7 +260,11 @@ class GATEnhancedGNNExplainer(ExplainerBase):
                 h = x
 
             # Forward pass
-            raw_preds = self.model(x=h, edge_index=edge_index, **kwargs)
+            raw_preds = self.model(
+                x=h,
+                edge_index=edge_index,
+                **self._model_forward_kwargs(kwargs),
+            )
             loss = self.__loss__(raw_preds, ex_label)
 
             if epoch % 20 == 0 and debug:
@@ -304,7 +315,11 @@ class GATEnhancedGNNExplainer(ExplainerBase):
                     add_self_loops_for_explainer = False
                     break
 
-        if add_self_loops_for_explainer:
+        if self.explain_graph:
+            # 图分类解释必须与真实 forward 使用同一条 edge_index，
+            # 否则 heterogeneous edge_types 与 edge_mask 长度会失配。
+            self_loop_edge_index = edge_index
+        elif add_self_loops_for_explainer:
             self_loop_edge_index, _ = add_remaining_self_loops(edge_index, num_nodes=self.num_nodes)
         else:
             self_loop_edge_index = edge_index
@@ -330,8 +345,22 @@ class GATEnhancedGNNExplainer(ExplainerBase):
             self.__set_masks__(x, self_loop_edge_index)
         else:
             # Calculate masks for all classes
-            labels = tuple(i for i in range(kwargs.get('num_classes')))
-            ex_labels = tuple(torch.tensor([label]).to(self.device) for label in labels)
+            num_classes = kwargs.get('num_classes')
+            if num_classes is None:
+                num_classes = getattr(self.model, 'num_classes', None)
+
+            if target_label is not None:
+                if isinstance(target_label, torch.Tensor):
+                    ex_labels = (target_label.to(self.device).view(-1)[0:1],)
+                else:
+                    ex_labels = (torch.tensor([int(target_label)], device=self.device),)
+            else:
+                if num_classes is None:
+                    raise ValueError(
+                        "num_classes is required for GNNExplainer when target_label is not provided."
+                    )
+                labels = tuple(i for i in range(num_classes))
+                ex_labels = tuple(torch.tensor([label]).to(self.device) for label in labels)
 
             edge_masks = []
             for ex_label in ex_labels:
@@ -351,7 +380,12 @@ class GATEnhancedGNNExplainer(ExplainerBase):
 
         # Evaluate explanations
         with torch.no_grad():
-            related_preds = self.eval_related_pred(x, edge_index, hard_edge_masks, **kwargs)
+            related_preds = self.eval_related_pred(
+                x,
+                edge_index,
+                hard_edge_masks,
+                **self._model_forward_kwargs(kwargs),
+            )
 
         self.__clear_masks__()
 
