@@ -484,6 +484,18 @@ def gen_exp_lines(edge_index, edge_weight, index, num_nodes, lines):
     filtered_ret = [int(i[1]) for i in ret if i[0] > 0]
     return filtered_ret
 
+def load_checkpoint_strict(model, checkpoint_path, device):
+    checkpoint_state = torch.load(checkpoint_path, map_location=device)
+    try:
+        model.load_state_dict(checkpoint_state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "Checkpoint at {} is incompatible with the current model architecture. "
+            "Refusing to evaluate with partially loaded weights; please use a matching checkpoint or retrain the model. "
+            "Original error: {}".format(checkpoint_path, exc)
+        ) from exc
+
+
 def eval_exp(exp_saved_path, model, correct_lines, args):
     graph_exp_list = torch.load(exp_saved_path, map_location=args.device)
     print("Number of explanations:", len(graph_exp_list))
