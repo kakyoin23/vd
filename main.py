@@ -30,6 +30,14 @@ import matplotlib.pyplot as plt
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
+def normalize_gnn_model_name(name: str) -> str:
+    alias = {
+        "GCNConv": "GCN",
+        "GatedGraphConv": "GatedGraph",
+        "GATv2": "GAT",
+    }
+    return alias.get(name, name)
+
 class FocalLoss(torch.nn.Module):
     def __init__(self, alpha=None, gamma=2.0, reduction='mean'):
         super(FocalLoss, self).__init__()
@@ -210,7 +218,7 @@ def train(args, train_dataloader, valid_dataloader, test_dataloader, model):
             edge_type = getattr(batch_data, 'edge_types', None)
             if edge_type is not None:
                 edge_type = edge_type.to(args.device).long()
-            elif args.gnn_model in ["RGCN", "RGAT"]:
+            elif args.gnn_model_norm in ["RGCN", "RGAT"]:
                 edge_type = torch.zeros(edge_index.shape[1], dtype=torch.long, device=args.device)
 
             # --- [兼容] 处理 edge_attr (Transformer/GAT) ---
@@ -333,7 +341,7 @@ def evaluate(args, eval_dataloader, model, threshold=None, return_details=False)
             edge_type = getattr(batch_data, 'edge_types', None)
             if edge_type is not None:
                 edge_type = edge_type.to(args.device).long()
-            elif args.gnn_model in ["RGCN", "RGAT"]:
+            elif args.gnn_model_norm in ["RGCN", "RGAT"]:
                 edge_type = torch.zeros(edge_index.shape[1], dtype=torch.long, device=args.device)
 
             edge_attr = getattr(batch_data, 'edge_attr', None)
@@ -402,7 +410,7 @@ def calculate_validation_loss(args, valid_dataloader, model, class_weights):
             edge_type = getattr(batch_data, 'edge_types', None)
             if edge_type is not None:
                 edge_type = edge_type.to(args.device).long()
-            elif args.gnn_model in ["RGCN", "RGAT"]:
+            elif args.gnn_model_norm in ["RGCN", "RGAT"]:
                 edge_type = torch.zeros(edge_index.shape[1], dtype=torch.long, device=args.device)
             
             edge_attr = getattr(batch_data, 'edge_attr', None)
@@ -442,7 +450,7 @@ def calibrate_temperature(args, valid_dataloader, model, T_grid=np.linspace(0.5,
             edge_type = getattr(bd, 'edge_types', None)
             if edge_type is not None:
                 edge_type = edge_type.to(args.device).long()
-            elif args.gnn_model in ["RGCN", "RGAT"]:
+            elif args.gnn_model_norm in ["RGCN", "RGAT"]:
                 edge_type = torch.zeros(edge_index.shape[1], dtype=torch.long, device=args.device)
             
             edge_attr = getattr(bd, 'edge_attr', None)
@@ -520,7 +528,7 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
         edge_type = getattr(graph, 'edge_types', None)
         if edge_type is not None:
              edge_type = edge_type.to(args.device).long()
-        elif args.gnn_model in ["RGCN", "RGAT"]:
+        elif args.gnn_model_norm in ["RGCN", "RGAT"]:
              edge_type = torch.zeros(edge_index.shape[1], dtype=torch.long, device=args.device)
         
         edge_attr = getattr(graph, 'edge_attr', None)
@@ -586,10 +594,10 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
         # 反事实解释也需要适配 edge_attr / edge_types
         # 注意：这里简化处理，假设 edge_attr 不随边索引改变太复杂，暂时传入原始对应切片
         # GNNExplainer 主要是对 Edge Mask，所以特征不变
-        if args.gnn_model in ["RGCN", "RGAT"]:
+        if args.gnn_model_norm in ["RGCN", "RGAT"]:
             fac_edge_types = edge_type[index]
             fac_logits = model(x, fac_edge_index, batch, edge_types=fac_edge_types)
-        elif args.gnn_model in ["GATv2", "Transformer"] and args.use_edge_features and edge_attr is not None:
+        elif args.gnn_model_norm in ["GAT", "Transformer"] and args.use_edge_features and edge_attr is not None:
             # 这里的 edge_attr 需要对应 index 切片
             fac_edge_attr = edge_attr[index]
             fac_logits = model(x, fac_edge_index, batch, edge_attr=fac_edge_attr)
@@ -599,10 +607,10 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
         fac_pred = F.one_hot(torch.argmax(fac_logits, dim=-1), 2)[0][args.positive_class_id]
 
         cf_edge_index = edge_index[:, cf_index]
-        if args.gnn_model in ["RGCN", "RGAT"]:
+        if args.gnn_model_norm in ["RGCN", "RGAT"]:
             cf_edge_types = edge_type[cf_index]
             cf_logits = model(x, cf_edge_index, batch, edge_types=cf_edge_types)
-        elif args.gnn_model in ["GATv2", "Transformer"] and args.use_edge_features and edge_attr is not None:
+        elif args.gnn_model_norm in ["GAT", "Transformer"] and args.use_edge_features and edge_attr is not None:
             cf_edge_attr = edge_attr[cf_index]
             cf_logits = model(x, cf_edge_index, batch, edge_attr=cf_edge_attr)
         else:
@@ -624,7 +632,7 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
     visited_sampleids = set()
     print(f"Starting GNNExplainer on {len(test_dataset)} test samples")
     
-    if args.gnn_model == "GAT":
+    if args.gnn_model_norm == "GAT":
         explainer = GATEnhancedGNNExplainer(model=model, explain_graph=True, epochs=args.gnnexplainer_epochs, lr=args.gnnexplainer_lr)
     else:
         explainer = XGNNExplainer(model=model, explain_graph=True, epochs=args.gnnexplainer_epochs, lr=args.gnnexplainer_lr)
@@ -639,7 +647,7 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
         edge_type = getattr(graph, 'edge_types', None)
         if edge_type is not None:
              edge_type = edge_type.to(args.device).long()
-        elif args.gnn_model in ["RGCN", "RGAT"]:
+        elif args.gnn_model_norm in ["RGCN", "RGAT"]:
              edge_type = torch.zeros(edge_index.shape[1], dtype=torch.long, device=args.device)
         
         edge_attr = getattr(graph, 'edge_attr', None)
@@ -732,7 +740,7 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
         edge_type = getattr(graph, 'edge_types', None)
         if edge_type is not None:
              edge_type = edge_type.to(args.device).long()
-        elif args.gnn_model in ["RGCN", "RGAT"]:
+        elif args.gnn_model_norm in ["RGCN", "RGAT"]:
              edge_type = torch.zeros(edge_index.shape[1], dtype=torch.long, device=args.device)
         
         edge_attr = getattr(graph, 'edge_attr', None)
@@ -870,6 +878,7 @@ def main():
     parser.add_argument("--mask_seed", default=42, type=int)
 
     args = parser.parse_args()
+    args.gnn_model_norm = normalize_gnn_model_name(args.gnn_model)
 
     device = torch.device("cuda:" + str(args.cuda_id) if torch.cuda.is_available() else "cpu")
     args.device = device

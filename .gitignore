@@ -1,0 +1,19 @@
+# Python cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Model/data outputs
+saved_models/
+*.pt
+*.bin
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
