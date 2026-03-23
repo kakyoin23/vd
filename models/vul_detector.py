@@ -89,8 +89,10 @@ class EnhancedDetector(nn.Module):
             self.conv1 = GatedGraphConv(self.hidden_dim, num_layers=args.num_ggnn_steps)
         elif self.gnn_model == 'Transformer':
             self.conv1 = TransformerConv(self.hidden_dim, self.hidden_dim // args.num_heads, heads=args.num_heads, edge_dim=args.num_relations if args.residual else None)
-        elif self.gnn_model in ['RGCN', 'RGAT']:
+        elif self.gnn_model == 'RGCN':
             self.conv1 = RGCNConv(self.hidden_dim, self.hidden_dim, num_relations=args.num_relations)
+        elif self.gnn_model == 'RGAT':
+            self.conv1 = RGATConv(self.hidden_dim, self.hidden_dim, num_relations=args.num_relations)
         else:
             raise ValueError(f"Unsupported GNN model: {args.gnn_model}")
 
@@ -107,8 +109,10 @@ class EnhancedDetector(nn.Module):
                 pass # GGNN 自身就是多步的
             elif self.gnn_model == 'Transformer':
                 self.conv2 = TransformerConv(self.hidden_dim, self.hidden_dim // args.num_heads, heads=args.num_heads)
-            elif self.gnn_model in ['RGCN', 'RGAT']:
+            elif self.gnn_model == 'RGCN':
                 self.conv2 = RGCNConv(self.hidden_dim, self.hidden_dim, num_relations=args.num_relations)
+            elif self.gnn_model == 'RGAT':
+                self.conv2 = RGATConv(self.hidden_dim, self.hidden_dim, num_relations=args.num_relations)
 
         # 图池化层
         if args.graph_pooling == "sum":
@@ -179,7 +183,10 @@ class EnhancedDetector(nn.Module):
                 rel_types = torch.zeros(edge_index.size(1), dtype=torch.long, device=x.device)
             else:
                 rel_types = rel_types.long()
-            h_gnn = self.conv1(h, edge_index, rel_types)
+            if self.gnn_model == 'RGCN':
+                h_gnn = self.conv1(h, edge_index, rel_types)
+            else:
+                h_gnn = self.conv1(h, edge_index, edge_type=rel_types)
         else:
             h_gnn = self.conv1(h, edge_index)
 
@@ -197,7 +204,10 @@ class EnhancedDetector(nn.Module):
                     rel_types = torch.zeros(edge_index.size(1), dtype=torch.long, device=x.device)
                 else:
                     rel_types = rel_types.long()
-                h_new = self.conv2(h, edge_index, rel_types)
+                if self.gnn_model == 'RGCN':
+                    h_new = self.conv2(h, edge_index, rel_types)
+                else:
+                    h_new = self.conv2(h, edge_index, edge_type=rel_types)
             elif self.gnn_model == 'Transformer':
                 h_new = self.conv2(h, edge_index, edge_attr=edge_attr)
             else:
