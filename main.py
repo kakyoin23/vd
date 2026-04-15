@@ -517,8 +517,12 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
         return
 
     accuracy_cnt = 0
+    evaluated_cnt = 0
+    skipped_no_label_key = 0
+    skipped_empty_gt = 0
     precisions, recalls, F1s, pn = [], [], [], []
 
+    warned_legacy_line_index = False
     for graph in graph_exp_list:
         graph.to(args.device)
         x, edge_index = graph.x, graph.edge_index.long()
@@ -543,9 +547,13 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
             continue
 
         if int(sampleid) not in correct_lines:
+            skipped_no_label_key += 1
             continue
 
         exp_label_lines = list(correct_lines[int(sampleid)]["removed"])
+        if len(exp_label_lines) == 0:
+            skipped_empty_gt += 1
+            continue
 
         th = getattr(args, "exp_edge_thresh", -1.0)
         if th >= 0:
@@ -561,14 +569,22 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
             else:
                 index = torch.arange(edge_weight.shape[0])
 
-        if hasattr(graph, 'line_index'):
+        if hasattr(graph, 'line_number'):
+             lines = graph.line_number.cpu().numpy()
+        elif hasattr(graph, 'line_index'):
              lines = graph.line_index.cpu().numpy()
         elif hasattr(graph, '_LINE'):
              lines = graph._LINE.cpu().numpy()
         else:
              lines = np.arange(x.shape[0])
+        lines = np.asarray(lines).astype(int)
+        if (not hasattr(graph, 'line_number')) and (len(lines) > 0) and (int(np.max(lines)) >= 1_000_000) and (not warned_legacy_line_index):
+            print("[warn] detected legacy node-id based line_index (>=1e6). "
+                  "Please rebuild processed dataset to refresh line numbers.")
+            warned_legacy_line_index = True
 
         exp_lines = gen_exp_lines(edge_index, edge_weight, index, x.shape[0], lines)
+        evaluated_cnt += 1
 
         if any((l in exp_label_lines) for l in exp_lines):
             accuracy_cnt += 1
@@ -620,11 +636,12 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
 
         pn.append(int(cf_pred != pred))
 
-    N = max(1, len(graph_exp_list))
+    N = max(1, evaluated_cnt)
+    print(f"[eval] evaluated={evaluated_cnt}, skipped_no_label_key={skipped_no_label_key}, skipped_empty_gt={skipped_empty_gt}")
     print("Accuracy:", round(accuracy_cnt / N, 4))
-    print("Precision:", round(float(np.mean(precisions)), 4))
-    print("Recall:", round(float(np.mean(recalls)), 4))
-    print("F1:", round(float(np.mean(F1s)), 4))
+    print("Precision:", round(float(np.mean(precisions)) if len(precisions) else 0.0, 4))
+    print("Recall:", round(float(np.mean(recalls)) if len(recalls) else 0.0, 4))
+    print("F1:", round(float(np.mean(F1s)) if len(F1s) else 0.0, 4))
     print("Probability of Necessity:", round(float(sum(pn)) / len(pn) if len(pn) else 0.0, 4))
 
 def gnnexplainer_run(args, model, test_dataset, correct_lines):
