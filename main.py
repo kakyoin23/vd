@@ -1,4 +1,5 @@
 import os
+import shutil
 import gc
 import json
 import random
@@ -189,6 +190,7 @@ def train(args, train_dataloader, valid_dataloader, test_dataloader, model):
     scaler = GradScaler(enabled=(args.device.type == "cuda"))
 
     best_valid_f1 = 0.0
+    saved_best_checkpoint = False
     patience = 10
     patience_counter = 0
     best_epoch = 0
@@ -310,6 +312,7 @@ def train(args, train_dataloader, valid_dataloader, test_dataloader, model):
             output_path = os.path.join(output_dir, '{}'.format('model.bin'))
             torch.save(model_to_save.state_dict(), output_path)
             print(f"Saving best model (valid_f1={valid_f1:.4f}) to {output_path}")
+            saved_best_checkpoint = True
 
         if idx >= min_epochs:
             if is_best:
@@ -324,6 +327,16 @@ def train(args, train_dataloader, valid_dataloader, test_dataloader, model):
         else:
             if not is_best:
                 print(f"Warmup epoch {idx}: F1 did not improve ({valid_f1:.4f} <= {best_valid_f1:.4f})")
+
+    if not saved_best_checkpoint:
+        # 兜底：避免后续 --do_test 阶段因 checkpoint 缺失直接报 FileNotFoundError
+        checkpoint_prefix = 'checkpoint-best-f1'
+        output_dir = os.path.join(args.model_checkpoint_dir, '{}'.format(checkpoint_prefix))
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, 'model.bin')
+        model_to_save = model.module if hasattr(model, 'module') else model
+        torch.save(model_to_save.state_dict(), output_path)
+        print(f"[warn] no improving valid_f1 checkpoint was found; saved final epoch model to {output_path}")
 
     plot_training_curves(train_losses, valid_losses, train_accuracies, valid_accuracies, epochs_list, args.model_checkpoint_dir)
     return global_step, tr_loss / global_step if global_step > 0 else 0
@@ -893,6 +906,7 @@ def main():
 
     parser.add_argument("--mask_mode", default="aligned", type=str, choices=["aligned", "all_ones", "random"])
     parser.add_argument("--mask_seed", default=42, type=int)
+    parser.add_argument("--rebuild_processed", action='store_true', help="Force remove and rebuild processed graph dataset cache.")
 
     args = parser.parse_args()
     args.gnn_model_norm = normalize_gnn_model_name(args.gnn_model)
@@ -917,6 +931,22 @@ def main():
         else:
             suffix = f"_{args.mask_mode}"
         return str(utils.processed_dir() / "vul_graph_dataset" / f"{partition}_processed_target{suffix}" / "data.pt")
+    
+    def _dataset_processed_dir(partition: str) -> str:
+        if args.mask_mode == "aligned":
+            suffix = ""
+        elif args.mask_mode == "random":
+            suffix = f"_random_{args.mask_seed}"
+        else:
+            suffix = f"_{args.mask_mode}"
+        return str(utils.processed_dir() / "vul_graph_dataset" / f"{partition}_processed_target{suffix}")
+
+    if args.rebuild_processed:
+        for p in ["train", "val", "test"]:
+            proc_dir = _dataset_processed_dir(p)
+            if os.path.exists(proc_dir):
+                print(f"[cache] removing processed dataset dir: {proc_dir}")
+                shutil.rmtree(proc_dir)
 
     encoder = None
     tokenizer = None
@@ -944,6 +974,23 @@ def main():
     test_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='test', mask_mode=args.mask_mode, mask_seed=args.mask_seed, encoder=encoder, tokenizer=tokenizer)
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate, num_workers=4, pin_memory=True)
 
+    def _check_line_number_sanity(dataset, name: str):
+        if len(dataset) == 0:
+            return
+        g = dataset[0]
+        lines = None
+        if hasattr(g, 'line_number'):
+            lines = g.line_number.cpu().numpy()
+        elif hasattr(g, 'line_index'):
+            lines = g.line_index.cpu().numpy()
+        if lines is not None and len(lines) > 0 and int(np.max(lines)) >= 1_000_000:
+            print(f"[warn] {name} appears to contain legacy node-id line metadata (max line={int(np.max(lines))}). "
+                  "Use --rebuild_processed to regenerate cached dataset with real source line numbers.")
+
+    _check_line_number_sanity(train_dataset, "train_dataset")
+    _check_line_number_sanity(valid_dataset, "valid_dataset")
+    _check_line_number_sanity(test_dataset, "test_dataset")
+
     check_dataset_stats(train_dataloader, "Training")
     check_dataset_stats(valid_dataloader, "Validation")
     check_dataset_stats(test_dataloader, "Test")
@@ -958,6 +1005,12 @@ def main():
     if args.do_test:
         checkpoint_prefix = 'checkpoint-best-f1/model.bin'
         model_checkpoint_dir = os.path.join(args.model_checkpoint_dir, '{}'.format(checkpoint_prefix))
+        if not os.path.exists(model_checkpoint_dir):
+            raise FileNotFoundError(
+                f"Checkpoint not found: {model_checkpoint_dir}. "
+                "If this is a new GNN setting, run with --do_train first (or keep --do_train --do_test together) "
+                "to create checkpoint-best-f1/model.bin."
+            )
         checkpoint_state = torch.load(model_checkpoint_dir, map_location=args.device)
         load_result = model.load_state_dict(checkpoint_state, strict=False)
         if load_result.missing_keys:
