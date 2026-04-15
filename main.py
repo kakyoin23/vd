@@ -3,6 +3,7 @@ import shutil
 import gc
 import json
 import random
+import traceback
 import argparse
 import warnings
 
@@ -660,6 +661,7 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
 def gnnexplainer_run(args, model, test_dataset, correct_lines):
     graph_exp_list = []
     visited_sampleids = set()
+    error_count = 0
     print(f"Starting GNNExplainer on {len(test_dataset)} test samples")
     
     if args.gnn_model_norm == "GAT":
@@ -736,10 +738,24 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
             graph_exp_list.append(graph.detach().clone().cpu())
             visited_sampleids.add(sampleid)
         except Exception as e:
-            print(f"Error processing {sampleid}: {e}")
+            error_count += 1
+            err_type = type(e).__name__
+            print(f"Error processing {sampleid}: [{err_type}] {repr(e)}")
+            if getattr(args, "debug_explain", False) and error_count <= getattr(args, "debug_explain_max_errors", 20):
+                et_shape = tuple(edge_type.shape) if edge_type is not None else None
+                ea_shape = tuple(edge_attr.shape) if edge_attr is not None else None
+                print(
+                    f"[debug][sample={sampleid}] x={tuple(x.shape)} edge_index={tuple(edge_index.shape)} "
+                    f"edge_type={et_shape} edge_attr={ea_shape} label={int(label.item())} "
+                    f"prob_pos={float(prob[0][args.positive_class_id].item()):.6f}"
+                )
+                print("[debug][traceback]")
+                print(traceback.format_exc())
             explainer.__clear_masks__()
             continue
 
+    if error_count > 0:
+        print(f"[explain] finished with {error_count} explainer errors; successful explanations={len(graph_exp_list)}")
     return graph_exp_list
 
 def cfexplainer_run(args, model, test_dataset, correct_lines):
@@ -907,6 +923,8 @@ def main():
     parser.add_argument("--mask_mode", default="aligned", type=str, choices=["aligned", "all_ones", "random"])
     parser.add_argument("--mask_seed", default=42, type=int)
     parser.add_argument("--rebuild_processed", action='store_true', help="Force remove and rebuild processed graph dataset cache.")
+    parser.add_argument("--debug_explain", action='store_true', help="Print detailed traceback/context for explainer failures.")
+    parser.add_argument("--debug_explain_max_errors", type=int, default=20, help="Max number of detailed explainer errors to print.")
 
     args = parser.parse_args()
     args.gnn_model_norm = normalize_gnn_model_name(args.gnn_model)
