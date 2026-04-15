@@ -1,7 +1,9 @@
 import os
+import shutil
 import gc
 import json
 import random
+import traceback
 import argparse
 import warnings
 
@@ -189,6 +191,7 @@ def train(args, train_dataloader, valid_dataloader, test_dataloader, model):
     scaler = GradScaler(enabled=(args.device.type == "cuda"))
 
     best_valid_f1 = 0.0
+    saved_best_checkpoint = False
     patience = 10
     patience_counter = 0
     best_epoch = 0
@@ -310,6 +313,7 @@ def train(args, train_dataloader, valid_dataloader, test_dataloader, model):
             output_path = os.path.join(output_dir, '{}'.format('model.bin'))
             torch.save(model_to_save.state_dict(), output_path)
             print(f"Saving best model (valid_f1={valid_f1:.4f}) to {output_path}")
+            saved_best_checkpoint = True
 
         if idx >= min_epochs:
             if is_best:
@@ -324,6 +328,16 @@ def train(args, train_dataloader, valid_dataloader, test_dataloader, model):
         else:
             if not is_best:
                 print(f"Warmup epoch {idx}: F1 did not improve ({valid_f1:.4f} <= {best_valid_f1:.4f})")
+
+    if not saved_best_checkpoint:
+        # 兜底：避免后续 --do_test 阶段因 checkpoint 缺失直接报 FileNotFoundError
+        checkpoint_prefix = 'checkpoint-best-f1'
+        output_dir = os.path.join(args.model_checkpoint_dir, '{}'.format(checkpoint_prefix))
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, 'model.bin')
+        model_to_save = model.module if hasattr(model, 'module') else model
+        torch.save(model_to_save.state_dict(), output_path)
+        print(f"[warn] no improving valid_f1 checkpoint was found; saved final epoch model to {output_path}")
 
     plot_training_curves(train_losses, valid_losses, train_accuracies, valid_accuracies, epochs_list, args.model_checkpoint_dir)
     return global_step, tr_loss / global_step if global_step > 0 else 0
@@ -517,8 +531,12 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
         return
 
     accuracy_cnt = 0
+    evaluated_cnt = 0
+    skipped_no_label_key = 0
+    skipped_empty_gt = 0
     precisions, recalls, F1s, pn = [], [], [], []
 
+    warned_legacy_line_index = False
     for graph in graph_exp_list:
         graph.to(args.device)
         x, edge_index = graph.x, graph.edge_index.long()
@@ -543,9 +561,13 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
             continue
 
         if int(sampleid) not in correct_lines:
+            skipped_no_label_key += 1
             continue
 
         exp_label_lines = list(correct_lines[int(sampleid)]["removed"])
+        if len(exp_label_lines) == 0:
+            skipped_empty_gt += 1
+            continue
 
         th = getattr(args, "exp_edge_thresh", -1.0)
         if th >= 0:
@@ -561,14 +583,22 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
             else:
                 index = torch.arange(edge_weight.shape[0])
 
-        if hasattr(graph, 'line_index'):
+        if hasattr(graph, 'line_number'):
+             lines = graph.line_number.cpu().numpy()
+        elif hasattr(graph, 'line_index'):
              lines = graph.line_index.cpu().numpy()
         elif hasattr(graph, '_LINE'):
              lines = graph._LINE.cpu().numpy()
         else:
              lines = np.arange(x.shape[0])
+        lines = np.asarray(lines).astype(int)
+        if (not hasattr(graph, 'line_number')) and (len(lines) > 0) and (int(np.max(lines)) >= 1_000_000) and (not warned_legacy_line_index):
+            print("[warn] detected legacy node-id based line_index (>=1e6). "
+                  "Please rebuild processed dataset to refresh line numbers.")
+            warned_legacy_line_index = True
 
         exp_lines = gen_exp_lines(edge_index, edge_weight, index, x.shape[0], lines)
+        evaluated_cnt += 1
 
         if any((l in exp_label_lines) for l in exp_lines):
             accuracy_cnt += 1
@@ -620,16 +650,18 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
 
         pn.append(int(cf_pred != pred))
 
-    N = max(1, len(graph_exp_list))
+    N = max(1, evaluated_cnt)
+    print(f"[eval] evaluated={evaluated_cnt}, skipped_no_label_key={skipped_no_label_key}, skipped_empty_gt={skipped_empty_gt}")
     print("Accuracy:", round(accuracy_cnt / N, 4))
-    print("Precision:", round(float(np.mean(precisions)), 4))
-    print("Recall:", round(float(np.mean(recalls)), 4))
-    print("F1:", round(float(np.mean(F1s)), 4))
+    print("Precision:", round(float(np.mean(precisions)) if len(precisions) else 0.0, 4))
+    print("Recall:", round(float(np.mean(recalls)) if len(recalls) else 0.0, 4))
+    print("F1:", round(float(np.mean(F1s)) if len(F1s) else 0.0, 4))
     print("Probability of Necessity:", round(float(sum(pn)) / len(pn) if len(pn) else 0.0, 4))
 
 def gnnexplainer_run(args, model, test_dataset, correct_lines):
     graph_exp_list = []
     visited_sampleids = set()
+    error_count = 0
     print(f"Starting GNNExplainer on {len(test_dataset)} test samples")
     
     if args.gnn_model_norm == "GAT":
@@ -706,10 +738,24 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
             graph_exp_list.append(graph.detach().clone().cpu())
             visited_sampleids.add(sampleid)
         except Exception as e:
-            print(f"Error processing {sampleid}: {e}")
+            error_count += 1
+            err_type = type(e).__name__
+            print(f"Error processing {sampleid}: [{err_type}] {repr(e)}")
+            if getattr(args, "debug_explain", False) and error_count <= getattr(args, "debug_explain_max_errors", 20):
+                et_shape = tuple(edge_type.shape) if edge_type is not None else None
+                ea_shape = tuple(edge_attr.shape) if edge_attr is not None else None
+                print(
+                    f"[debug][sample={sampleid}] x={tuple(x.shape)} edge_index={tuple(edge_index.shape)} "
+                    f"edge_type={et_shape} edge_attr={ea_shape} label={int(label.item())} "
+                    f"prob_pos={float(prob[0][args.positive_class_id].item()):.6f}"
+                )
+                print("[debug][traceback]")
+                print(traceback.format_exc())
             explainer.__clear_masks__()
             continue
 
+    if error_count > 0:
+        print(f"[explain] finished with {error_count} explainer errors; successful explanations={len(graph_exp_list)}")
     return graph_exp_list
 
 def cfexplainer_run(args, model, test_dataset, correct_lines):
@@ -876,6 +922,9 @@ def main():
 
     parser.add_argument("--mask_mode", default="aligned", type=str, choices=["aligned", "all_ones", "random"])
     parser.add_argument("--mask_seed", default=42, type=int)
+    parser.add_argument("--rebuild_processed", action='store_true', help="Force remove and rebuild processed graph dataset cache.")
+    parser.add_argument("--debug_explain", action='store_true', help="Print detailed traceback/context for explainer failures.")
+    parser.add_argument("--debug_explain_max_errors", type=int, default=20, help="Max number of detailed explainer errors to print.")
 
     args = parser.parse_args()
     args.gnn_model_norm = normalize_gnn_model_name(args.gnn_model)
@@ -900,6 +949,22 @@ def main():
         else:
             suffix = f"_{args.mask_mode}"
         return str(utils.processed_dir() / "vul_graph_dataset" / f"{partition}_processed_target{suffix}" / "data.pt")
+    
+    def _dataset_processed_dir(partition: str) -> str:
+        if args.mask_mode == "aligned":
+            suffix = ""
+        elif args.mask_mode == "random":
+            suffix = f"_random_{args.mask_seed}"
+        else:
+            suffix = f"_{args.mask_mode}"
+        return str(utils.processed_dir() / "vul_graph_dataset" / f"{partition}_processed_target{suffix}")
+
+    if args.rebuild_processed:
+        for p in ["train", "val", "test"]:
+            proc_dir = _dataset_processed_dir(p)
+            if os.path.exists(proc_dir):
+                print(f"[cache] removing processed dataset dir: {proc_dir}")
+                shutil.rmtree(proc_dir)
 
     encoder = None
     tokenizer = None
@@ -927,6 +992,23 @@ def main():
     test_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='test', mask_mode=args.mask_mode, mask_seed=args.mask_seed, encoder=encoder, tokenizer=tokenizer)
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate, num_workers=4, pin_memory=True)
 
+    def _check_line_number_sanity(dataset, name: str):
+        if len(dataset) == 0:
+            return
+        g = dataset[0]
+        lines = None
+        if hasattr(g, 'line_number'):
+            lines = g.line_number.cpu().numpy()
+        elif hasattr(g, 'line_index'):
+            lines = g.line_index.cpu().numpy()
+        if lines is not None and len(lines) > 0 and int(np.max(lines)) >= 1_000_000:
+            print(f"[warn] {name} appears to contain legacy node-id line metadata (max line={int(np.max(lines))}). "
+                  "Use --rebuild_processed to regenerate cached dataset with real source line numbers.")
+
+    _check_line_number_sanity(train_dataset, "train_dataset")
+    _check_line_number_sanity(valid_dataset, "valid_dataset")
+    _check_line_number_sanity(test_dataset, "test_dataset")
+
     check_dataset_stats(train_dataloader, "Training")
     check_dataset_stats(valid_dataloader, "Validation")
     check_dataset_stats(test_dataloader, "Test")
@@ -941,6 +1023,12 @@ def main():
     if args.do_test:
         checkpoint_prefix = 'checkpoint-best-f1/model.bin'
         model_checkpoint_dir = os.path.join(args.model_checkpoint_dir, '{}'.format(checkpoint_prefix))
+        if not os.path.exists(model_checkpoint_dir):
+            raise FileNotFoundError(
+                f"Checkpoint not found: {model_checkpoint_dir}. "
+                "If this is a new GNN setting, run with --do_train first (or keep --do_train --do_test together) "
+                "to create checkpoint-best-f1/model.bin."
+            )
         checkpoint_state = torch.load(model_checkpoint_dir, map_location=args.device)
         load_result = model.load_state_dict(checkpoint_state, strict=False)
         if load_result.missing_keys:
