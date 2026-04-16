@@ -341,11 +341,21 @@ class VulGraphDataset(Dataset):
                 if true_label == 1: stats["vul"] += 1
                 else: stats["non"] += 1
 
-                node_ids = n['id'] if 'id' in n.columns else n.index
-                try:
-                    code_graph.line_index = torch.Tensor(node_ids.astype(int).to_numpy())
-                except:
-                    code_graph.line_index = torch.Tensor(n.index.to_numpy())
+                # 解释评估需要“源码行号”，不能使用节点 id（节点 id 往往是 1000xxx 这类内部编号）
+                # 为兼容历史逻辑，保留 line_index 字段，但其语义固定为源码行号。
+                if 'lineNumber' in n.columns:
+                    try:
+                        line_numbers = n['lineNumber'].astype(int).to_numpy()
+                    except Exception:
+                        line_numbers = pd.to_numeric(n['lineNumber'], errors='coerce').fillna(-1).astype(int).to_numpy()
+                    code_graph.line_index = torch.tensor(line_numbers, dtype=torch.long)
+                    # 显式存一份别名，便于后续评估/诊断时做健壮回退
+                    code_graph.line_number = torch.tensor(line_numbers, dtype=torch.long)
+                else:
+                    # 兜底：没有 lineNumber 时再退回节点顺序
+                    fallback_index = n.index.to_numpy()
+                    code_graph.line_index = torch.tensor(fallback_index, dtype=torch.long)
+                    code_graph.line_number = torch.tensor(fallback_index, dtype=torch.long)
 
                 code_graph.sample_id = torch.Tensor([int(_id)] * len(n))
 
