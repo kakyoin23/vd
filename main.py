@@ -781,6 +781,7 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
     explainer.device = args.device
 
     for graph in test_dataset:
+        explainer.__clear_masks__()
         graph.to(args.device)
         x, edge_index, batch = graph.x, graph.edge_index.long(), graph.batch
         
@@ -853,6 +854,7 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
                 )
                 print("[debug][traceback]")
                 print(traceback.format_exc())
+            explainer.__clear_masks__()
             continue
 
     if error_count > 0:

@@ -116,6 +116,14 @@ class CFExplainer(ExplainerBase):
             else:
                 _ = self.model(dummy_x, dummy_edge_index, dummy_batch)
 
+    @staticmethod
+    def _model_forward_kwargs(kwargs):
+        """Remove explainer-only kwargs before calling detector forward."""
+        model_kwargs = dict(kwargs)
+        for key in ["num_classes", "sparsity", "edge_masks", "node_idx", "target_label"]:
+            model_kwargs.pop(key, None)
+        return model_kwargs
+
     def __set_masks__(self, x: Tensor, edge_index: Tensor, init: str = "normal"):
         (N, F), E = x.size(), edge_index.size(1)
 
@@ -185,7 +193,7 @@ class CFExplainer(ExplainerBase):
 
         for epoch in range(1, self.epochs + 1):
             h = x * self.node_feat_mask.view(1, -1).sigmoid() if mask_features else x
-            raw_preds = self.model(x=h, edge_index=edge_index, **kwargs)
+            raw_preds = self.model(x=h, edge_index=edge_index, **self._model_forward_kwargs(kwargs))
             loss = self.__loss__(raw_preds, ex_label)
 
             if epoch % 20 == 0 and debug:
@@ -244,7 +252,9 @@ class CFExplainer(ExplainerBase):
         hard_edge_masks = [self.control_sparsity(mask, sparsity=kwargs.get('sparsity'))
                            for mask in edge_masks]
         with torch.no_grad():
-            related_preds = self.eval_related_pred(x, edge_index, hard_edge_masks, **kwargs)
+            related_preds = self.eval_related_pred(
+                x, edge_index, hard_edge_masks, **self._model_forward_kwargs(kwargs)
+            )
         self.__clear_masks__()
         return edge_masks, hard_edge_masks, related_preds, self_loop_edge_index
 
