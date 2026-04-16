@@ -761,6 +761,7 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
 def cfexplainer_run(args, model, test_dataset, correct_lines):
     graph_exp_list = []
     visited_sampleids = set()
+    error_count = 0
     model.eval()
     
     # 简单的 dummy 初始化检测
@@ -813,18 +814,49 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
         print(f"解释样本: {sampleid}")
 
         try:
-            edge_mask = explainer(x, edge_index)
+            target_label = torch.argmax(prob, dim=-1).detach()
+            edge_mask = explainer(
+                x,
+                edge_index,
+                batch=batch,
+                edge_attr=edge_attr,
+                edge_types=edge_type,
+                num_classes=args.num_classes,
+                target_label=target_label,
+            )
             if isinstance(edge_mask, tuple): edge_mask = edge_mask[0]
-            
-            edge_weight = 1 - edge_mask[torch.argmax(exp_prob_label, dim=-1)]
+
+            if edge_mask is None:
+                raise RuntimeError("CFExplainer returned None edge_mask.")
+            if isinstance(edge_mask, (list, tuple)):
+                pred_idx = int(torch.argmax(exp_prob_label, dim=-1).item())
+                edge_weight = edge_mask[0] if len(edge_mask) == 1 else edge_mask[pred_idx]
+            else:
+                edge_weight = edge_mask
+
+            edge_weight = 1 - edge_weight
             graph.__setitem__("edge_weight", torch.Tensor(edge_weight.detach().cpu()))
             graph.__setitem__("pred", exp_prob_label[0][args.positive_class_id])
             graph_exp_list.append(graph.detach().clone().cpu())
             visited_sampleids.add(sampleid)
         except Exception as e:
-            print(f"Error {sampleid}: {e}")
+            error_count += 1
+            err_type = type(e).__name__
+            print(f"Error {sampleid}: [{err_type}] {repr(e)}")
+            if getattr(args, "debug_explain", False) and error_count <= getattr(args, "debug_explain_max_errors", 20):
+                et_shape = tuple(edge_type.shape) if edge_type is not None else None
+                ea_shape = tuple(edge_attr.shape) if edge_attr is not None else None
+                print(
+                    f"[debug][sample={sampleid}] x={tuple(x.shape)} edge_index={tuple(edge_index.shape)} "
+                    f"edge_type={et_shape} edge_attr={ea_shape} label={int(label.item())} "
+                    f"prob_pos={float(prob[0][args.positive_class_id].item()):.6f}"
+                )
+                print("[debug][traceback]")
+                print(traceback.format_exc())
             continue
 
+    if error_count > 0:
+        print(f"[explain] finished with {error_count} cfexplainer errors; successful explanations={len(graph_exp_list)}")
     return graph_exp_list
 
 def main():
