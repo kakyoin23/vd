@@ -213,7 +213,11 @@ class CFExplainer(ExplainerBase):
         super().forward(x=x, edge_index=edge_index, **kwargs)
         self.model.eval()
 
-        self_loop_edge_index, _ = add_remaining_self_loops(edge_index, num_nodes=self.num_nodes)
+        if self.explain_graph:
+            # 图级解释必须与真实 forward 使用同一 edge_index，避免 edge_mask 与边数量失配
+            self_loop_edge_index = edge_index
+        else:
+            self_loop_edge_index, _ = add_remaining_self_loops(edge_index, num_nodes=self.num_nodes)
 
         if not self.explain_graph:
             self.node_idx = node_idx = kwargs.get('node_idx')
@@ -244,7 +248,7 @@ class CFExplainer(ExplainerBase):
                 if target_label is None or ex_label.item() == target_label.item():
                     self.__clear_masks__()
                     self.__set_masks__(x, self_loop_edge_index)
-                    edge_mask = self.gnn_explainer_alg(x, edge_index, ex_label, **kwargs).sigmoid()
+                    edge_mask = self.gnn_explainer_alg(x, self_loop_edge_index, ex_label, **kwargs).sigmoid()
                     if self._symmetric_edge_mask_indirect_graph:
                         edge_mask = symmetric_edge_mask_indirect_graph(self_loop_edge_index, edge_mask)
                     edge_masks.append(edge_mask)
@@ -253,7 +257,7 @@ class CFExplainer(ExplainerBase):
                            for mask in edge_masks]
         with torch.no_grad():
             related_preds = self.eval_related_pred(
-                x, edge_index, hard_edge_masks, **self._model_forward_kwargs(kwargs)
+                x, self_loop_edge_index, hard_edge_masks, **self._model_forward_kwargs(kwargs)
             )
         self.__clear_masks__()
         return edge_masks, hard_edge_masks, related_preds, self_loop_edge_index

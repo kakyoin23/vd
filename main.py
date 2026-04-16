@@ -816,12 +816,17 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
 
         try:
             target_label = torch.argmax(prob, dim=-1).detach()
+            exp_edge_type = edge_type
+            if args.gnn_model_norm in ["RGCN", "RGAT"] and edge_type is not None:
+                # RGCN/RGAT 在 explain 模式下会按 relation 分边传播，导致 edge_mask 与分片边数失配。
+                # 解释阶段临时把 relation 折叠到单一类型，避免 MessagePassing 的尺寸断言失败。
+                exp_edge_type = torch.zeros_like(edge_type)
             edge_mask = explainer(
                 x,
                 edge_index,
                 batch=batch,
                 edge_attr=edge_attr,
-                edge_types=edge_type,
+                edge_types=exp_edge_type,
                 num_classes=args.num_classes,
                 target_label=target_label,
             )
