@@ -485,7 +485,7 @@ def calibrate_temperature(args, valid_dataloader, model, T_grid=np.linspace(0.5,
     print(f"[calib] best temperature T={best_T:.3f}")
     return best_T
 
-def gen_exp_lines(edge_index, edge_weight, index, num_nodes, lines):
+def gen_exp_lines(edge_index, edge_weight, index, num_nodes, lines, agg: str = "sum", top_n: int = None, min_line: int = 1):
     temp = torch.zeros_like(edge_weight).to(edge_index.device)
     temp[index] = edge_weight[index]
 
@@ -502,9 +502,28 @@ def gen_exp_lines(edge_index, edge_weight, index, num_nodes, lines):
     line_importance_in = torch.spmm(adj_mask.T, line_importance_init) / in_degree.unsqueeze(-1)
     line_importance = line_importance_out + line_importance_in
 
-    ret = sorted(list(zip(line_importance.squeeze(-1).cpu().numpy(), lines)), reverse=True)
-    filtered_ret = [int(i[1]) for i in ret if i[0] > 0]
-    return filtered_ret
+    raw_scores = line_importance.squeeze(-1).detach().cpu().numpy()
+    line_ids = np.asarray(lines).astype(int)
+
+    # A 方案：行级聚合 + 去重 + 过滤非法行号
+    line2score = {}
+    for s, l in zip(raw_scores, line_ids):
+        if s <= 0:
+            continue
+        if l < min_line:
+            continue
+        if l not in line2score:
+            line2score[l] = float(s)
+        else:
+            if agg == "max":
+                line2score[l] = max(line2score[l], float(s))
+            else:
+                line2score[l] += float(s)
+
+    ranked = sorted(line2score.items(), key=lambda x: x[1], reverse=True)
+    if top_n is not None and top_n > 0:
+        ranked = ranked[:top_n]
+    return [int(line) for line, _ in ranked]
 
 def load_checkpoint_strict(model, checkpoint_path, device):
     checkpoint_state = torch.load(checkpoint_path, map_location=device)
@@ -597,7 +616,16 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
                   "Please rebuild processed dataset to refresh line numbers.")
             warned_legacy_line_index = True
 
-        exp_lines = gen_exp_lines(edge_index, edge_weight, index, x.shape[0], lines)
+        exp_lines = gen_exp_lines(
+            edge_index,
+            edge_weight,
+            index,
+            x.shape[0],
+            lines,
+            agg=getattr(args, "exp_line_agg", "sum"),
+            top_n=getattr(args, "exp_top_lines", 3),
+            min_line=1,
+        )
         evaluated_cnt += 1
 
         if any((l in exp_label_lines) for l in exp_lines):
@@ -707,8 +735,11 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
         # model 调用需要适配 edge_attr
         prob = model(x, edge_index, batch, edge_attr=edge_attr, edge_types=edge_type)
         exp_prob_label = F.one_hot(torch.argmax(prob, dim=-1), 2)
+        prob_pos = float(F.softmax(prob, dim=-1)[0][args.positive_class_id].item())
         
         if label != args.positive_class_id or prob[0][args.positive_class_id] < prob[0][1 - args.positive_class_id]:
+            continue
+        if prob_pos < getattr(args, "explain_min_prob", 0.0):
             continue
             
         print(f"解释样本: {sampleid}")
@@ -747,7 +778,7 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
                 print(
                     f"[debug][sample={sampleid}] x={tuple(x.shape)} edge_index={tuple(edge_index.shape)} "
                     f"edge_type={et_shape} edge_attr={ea_shape} label={int(label.item())} "
-                    f"prob_pos={float(prob[0][args.positive_class_id].item()):.6f}"
+                    f"prob_pos={prob_pos:.6f}"
                 )
                 print("[debug][traceback]")
                 print(traceback.format_exc())
@@ -810,7 +841,10 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
 
         prob = model(x, edge_index, batch, edge_attr=edge_attr, edge_types=edge_type)
         exp_prob_label = F.one_hot(torch.argmax(prob, dim=-1), 2)
+        prob_pos = float(F.softmax(prob, dim=-1)[0][args.positive_class_id].item())
         if label != args.positive_class_id or prob[0][args.positive_class_id] < prob[0][1 - args.positive_class_id]:
+            continue
+        if prob_pos < getattr(args, "explain_min_prob", 0.0):
             continue
         print(f"解释样本: {sampleid}")
 
@@ -855,7 +889,7 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
                 print(
                     f"[debug][sample={sampleid}] x={tuple(x.shape)} edge_index={tuple(edge_index.shape)} "
                     f"edge_type={et_shape} edge_attr={ea_shape} label={int(label.item())} "
-                    f"prob_pos={float(prob[0][args.positive_class_id].item()):.6f}"
+                    f"prob_pos={prob_pos:.6f}"
                 )
                 print("[debug][traceback]")
                 print(traceback.format_exc())
@@ -953,6 +987,7 @@ def main():
     
     parser.add_argument('--exp_top_lines', type=int, default=3)
     parser.add_argument('--exp_line_agg', type=str, default='sum', choices=['sum', 'max'])
+    parser.add_argument('--explain_min_prob', type=float, default=0.0, help='Only explain positive samples with predicted positive probability >= this threshold.')
     
     parser.add_argument("--gnnexplainer_epochs", default=1000, type=int)
     parser.add_argument("--gnnexplainer_lr", default=0.05, type=float)
