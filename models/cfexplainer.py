@@ -14,11 +14,16 @@ from typing import Union
 class CFExplainer(ExplainerBase):
     def __init__(self, model: torch.nn.Module, epochs: int = 100, lr: float = 0.01, 
                  alpha: float = 0.9, explain_graph: bool = False, 
-                 indirect_graph_symmetric_weights: bool = False, L1_dist: bool = False):
+                 indirect_graph_symmetric_weights: bool = False, L1_dist: bool = False,
+                 mask_prior_lambda: float = 0.0, init_with_mask: bool = True, mask_prior_mode: str = "mean"):
         super(CFExplainer, self).__init__(model, epochs, lr, explain_graph)
         self.alpha = alpha
         self.L1_dist = L1_dist
         self._symmetric_edge_mask_indirect_graph = indirect_graph_symmetric_weights
+        self.mask_prior_lambda = mask_prior_lambda
+        self.init_with_mask = init_with_mask
+        self.mask_prior_mode = mask_prior_mode
+        self.edge_prior = None
 
         # 🆕 安全地冻结参数
         self._safe_freeze_parameters()
@@ -131,9 +136,26 @@ class CFExplainer(ExplainerBase):
             torch.randn(F, requires_grad=True, device=self.device) * 0.1
         )
         std = torch.nn.init.calculate_gain('relu') * sqrt(2.0 / (2 * N))
-        self.edge_mask = torch.nn.Parameter(
-            torch.randn(E, requires_grad=True, device=self.device) * std
-        )
+        edge_mask_init = torch.randn(E, requires_grad=True, device=self.device) * std
+
+        self.edge_prior = None
+        # 切片掩码先验（基于输入第 769 维），可用于初始化与正则
+        if F >= 769:
+            node_slice = x[:, 768].detach().float().clamp(0, 1)
+            src, dst = edge_index[0], edge_index[1]
+            if self.mask_prior_mode == "prod":
+                edge_prior = node_slice[src] * node_slice[dst]
+            elif self.mask_prior_mode == "max":
+                edge_prior = torch.max(node_slice[src], node_slice[dst])
+            else:
+                edge_prior = 0.5 * (node_slice[src] + node_slice[dst])
+            self.edge_prior = edge_prior.detach()
+
+            if self.init_with_mask:
+                # 在随机初始化基础上叠加先验偏置，提升优化稳定性
+                edge_mask_init = edge_mask_init + (self.edge_prior - 0.5) * (2.0 * std)
+
+        self.edge_mask = torch.nn.Parameter(edge_mask_init)
 
         loop_mask = edge_index[0] != edge_index[1]
         for module in self.model.modules():
@@ -179,7 +201,15 @@ class CFExplainer(ExplainerBase):
             edge_dist_loss = m.abs().sum()
         else:
             edge_dist_loss = F.binary_cross_entropy(m, torch.zeros_like(m, device=m.device))
-        return self.alpha * cf_loss + (1 - self.alpha) * edge_dist_loss
+
+        total_loss = self.alpha * cf_loss + (1 - self.alpha) * edge_dist_loss
+
+        if self.edge_prior is not None and self.mask_prior_lambda > 0:
+            prior = self.edge_prior.to(m.device)
+            prior_loss = F.binary_cross_entropy(m, prior)
+            total_loss = total_loss + self.mask_prior_lambda * prior_loss
+
+        return total_loss
 
     def gnn_explainer_alg(self,
                           x: Tensor,

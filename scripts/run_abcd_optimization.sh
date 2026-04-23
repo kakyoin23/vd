@@ -21,6 +21,8 @@ LINE_AGGS=(sum max)
 TOP_LINES=(3 5)
 GNNE_LRS=(0.03 0.05)
 GNNE_EPOCHS=(300 600)
+CF_MASK_PRIOR_LAMBDAS=(0.0 0.2)
+CF_MASK_PRIOR_MODES=(mean max)
 
 for mask_mode in "${MASK_MODES[@]}"; do
   for mask_seed in "${MASK_SEEDS[@]}"; do
@@ -32,25 +34,32 @@ for mask_mode in "${MASK_MODES[@]}"; do
             for topn in "${TOP_LINES[@]}"; do
               for lr in "${GNNE_LRS[@]}"; do
                 for ep in "${GNNE_EPOCHS[@]}"; do
-                  tag="abcd_${mask_mode}_s${mask_seed}_km${km}_th${th}_p${minp}_${agg}_top${topn}_lr${lr}_ep${ep}"
-                  echo "[RUN] ${tag}"
-                  python main.py \
-                    --do_test --do_explain \
-                    --gnn_model "${GNN_MODEL}" \
-                    --ipt_method "${IPT_METHOD}" \
-                    --KM "${km}" \
-                    --exp_edge_thresh "${th}" \
-                    --explain_min_prob "${minp}" \
-                    --exp_line_agg "${agg}" \
-                    --exp_top_lines "${topn}" \
-                    --gnnexplainer_lr "${lr}" \
-                    --gnnexplainer_epochs "${ep}" \
-                    --mask_mode "${mask_mode}" \
-                    --mask_seed "${mask_seed}" \
-                    --model_checkpoint_dir "${CKPT_DIR}" \
-                    --cuda_id "${CUDA_ID}" \
-                    --overwrite_explain \
-                    --explain_cache_tag "${tag}"
+                  for cfl in "${CF_MASK_PRIOR_LAMBDAS[@]}"; do
+                    for cfm in "${CF_MASK_PRIOR_MODES[@]}"; do
+                      tag="abcd_${mask_mode}_s${mask_seed}_km${km}_th${th}_p${minp}_${agg}_top${topn}_lr${lr}_ep${ep}_cfl${cfl}_${cfm}"
+                      echo "[RUN] ${tag}"
+                      python main.py \
+                        --do_test --do_explain \
+                        --gnn_model "${GNN_MODEL}" \
+                        --ipt_method "${IPT_METHOD}" \
+                        --KM "${km}" \
+                        --exp_edge_thresh "${th}" \
+                        --explain_min_prob "${minp}" \
+                        --exp_line_agg "${agg}" \
+                        --exp_top_lines "${topn}" \
+                        --gnnexplainer_lr "${lr}" \
+                        --gnnexplainer_epochs "${ep}" \
+                        --cfexp_mask_prior_lambda "${cfl}" \
+                        --cfexp_mask_prior_mode "${cfm}" \
+                        --cfexp_init_with_mask \
+                        --mask_mode "${mask_mode}" \
+                        --mask_seed "${mask_seed}" \
+                        --model_checkpoint_dir "${CKPT_DIR}" \
+                        --cuda_id "${CUDA_ID}" \
+                        --overwrite_explain \
+                        --explain_cache_tag "${tag}"
+                    done
+                  done
                 done
               done
             done

@@ -808,7 +808,17 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
     except Exception as e:
         print(f"Model init check failed (ignorable): {e}")
 
-    explainer = CFExplainer(model=model, explain_graph=True, epochs=args.cfexp_epochs, lr=args.cfexp_lr, alpha=args.cfexp_alpha, L1_dist=args.cfexp_L1)
+    explainer = CFExplainer(
+        model=model,
+        explain_graph=True,
+        epochs=args.cfexp_epochs,
+        lr=args.cfexp_lr,
+        alpha=args.cfexp_alpha,
+        L1_dist=args.cfexp_L1,
+        mask_prior_lambda=args.cfexp_mask_prior_lambda,
+        init_with_mask=args.cfexp_init_with_mask,
+        mask_prior_mode=args.cfexp_mask_prior_mode,
+    )
     explainer.device = args.device
 
     for graph in test_dataset:
@@ -973,6 +983,9 @@ def main():
     parser.add_argument('--overwrite_explain', action='store_true')
     parser.add_argument('--cfexp_epochs', type=int, default=800)
     parser.add_argument('--cfexp_lr', type=float, default=5e-2)
+    parser.add_argument('--cfexp_mask_prior_lambda', type=float, default=0.2, help='Weight of slice-mask prior loss in CFExplainer.')
+    parser.add_argument('--cfexp_mask_prior_mode', type=str, default='mean', choices=['mean', 'max', 'prod'], help='How to derive edge prior from endpoint slice masks.')
+    parser.add_argument('--cfexp_init_with_mask', action='store_true', help='Initialize CFExplainer edge mask with slice-mask prior.')
     parser.add_argument('--explain_cache_tag', type=str, default='')
     parser.add_argument('--exp_edge_thresh', type=float, default=-1.0)
 
@@ -1134,7 +1147,7 @@ def main():
             tag = f"_tag{args.explain_cache_tag}" if getattr(args, "explain_cache_tag", "") else ""
             ipt_save = os.path.join(
                 explain_dir,
-                f"{args.gnn_model}_{args.graph_pooling}_{args.ipt_method}_{args.KM}.pt"
+                f"{args.gnn_model}_{args.graph_pooling}_{args.ipt_method}_{args.KM}{tag}.pt"
             )
 
             print("Size of test dataset:", len(test_dataset))
