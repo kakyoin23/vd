@@ -14,11 +14,16 @@ from typing import Union
 class CFExplainer(ExplainerBase):
     def __init__(self, model: torch.nn.Module, epochs: int = 100, lr: float = 0.01, 
                  alpha: float = 0.9, explain_graph: bool = False, 
-                 indirect_graph_symmetric_weights: bool = False, L1_dist: bool = False):
+                 indirect_graph_symmetric_weights: bool = False, L1_dist: bool = False,
+                 mask_prior_lambda: float = 0.0, init_with_mask: bool = True, mask_prior_mode: str = "mean"):
         super(CFExplainer, self).__init__(model, epochs, lr, explain_graph)
         self.alpha = alpha
         self.L1_dist = L1_dist
         self._symmetric_edge_mask_indirect_graph = indirect_graph_symmetric_weights
+        self.mask_prior_lambda = mask_prior_lambda
+        self.init_with_mask = init_with_mask
+        self.mask_prior_mode = mask_prior_mode
+        self.edge_prior = None
 
         # 🆕 安全地冻结参数
         self._safe_freeze_parameters()
@@ -71,6 +76,224 @@ class CFExplainer(ExplainerBase):
 
         except Exception as e:
             print(f"参数冻结过程中出错: {e}")
+
+    def _initialize_with_comprehensive_dummy_data(self):
+        """使用更全面的虚拟数据初始化模型"""
+        device = next(self.model.parameters()).device
+
+        with torch.no_grad():
+            test_sizes = [2, 5, 10]
+            for size in test_sizes:
+                try:
+                    print(f"尝试使用 {size} 个节点的虚拟数据初始化...")
+                    dummy_x = torch.randn(size, 768).to(device)
+                    dummy_edge_index = torch.combinations(torch.arange(size), r=2).t().contiguous().to(device)
+                    dummy_batch = torch.zeros(size, dtype=torch.long).to(device)
+
+                    if hasattr(self.model, 'args') and getattr(self.model.args, 'use_edge_features', False):
+                        dummy_edge_attr = torch.randn(dummy_edge_index.size(1), 64).to(device)
+                        output = self.model(dummy_x, dummy_edge_index, dummy_batch, edge_attr=dummy_edge_attr)
+                    else:
+                        output = self.model(dummy_x, dummy_edge_index, dummy_batch)
+
+                    print(f"使用 {size} 个节点初始化成功，输出形状: {output.shape}")
+                    break
+                except Exception as e:
+                    print(f"使用 {size} 个节点初始化失败: {e}")
+                    continue
+
+    def _initialize_with_dummy_data(self):
+        """使用虚拟数据初始化模型"""
+        device = next(self.model.parameters()).device
+
+        with torch.no_grad():
+            num_nodes = 10
+            dummy_x = torch.randn(num_nodes, 768).to(device)
+            dummy_edge_index = torch.tensor([
+                [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+                [1, 2, 3, 4, 5, 6, 7, 8, 9, 0]
+            ], dtype=torch.long).to(device)
+            dummy_batch = torch.zeros(num_nodes, dtype=torch.long).to(device)
+
+            if hasattr(self.model, 'args') and getattr(self.model.args, 'use_edge_features', False):
+                dummy_edge_attr = torch.randn(dummy_edge_index.size(1), 64).to(device)
+                _ = self.model(dummy_x, dummy_edge_index, dummy_batch, edge_attr=dummy_edge_attr)
+            else:
+                _ = self.model(dummy_x, dummy_edge_index, dummy_batch)
+
+    @staticmethod
+    def _model_forward_kwargs(kwargs):
+        """Remove explainer-only kwargs before calling detector forward."""
+        model_kwargs = dict(kwargs)
+        for key in ["num_classes", "sparsity", "edge_masks", "node_idx", "target_label"]:
+            model_kwargs.pop(key, None)
+        return model_kwargs
+
+    def __set_masks__(self, x: Tensor, edge_index: Tensor, init: str = "normal"):
+        (N, F), E = x.size(), edge_index.size(1)
+
+        self.node_feat_mask = torch.nn.Parameter(
+            torch.randn(F, requires_grad=True, device=self.device) * 0.1
+        )
+        std = torch.nn.init.calculate_gain('relu') * sqrt(2.0 / (2 * N))
+        edge_mask_init = torch.randn(E, requires_grad=True, device=self.device) * std
+
+        self.edge_prior = None
+        # 切片掩码先验（基于输入第 769 维），可用于初始化与正则
+        if F >= 769:
+            node_slice = x[:, 768].detach().float().clamp(0, 1)
+            src, dst = edge_index[0], edge_index[1]
+            if self.mask_prior_mode == "prod":
+                edge_prior = node_slice[src] * node_slice[dst]
+            elif self.mask_prior_mode == "max":
+                edge_prior = torch.max(node_slice[src], node_slice[dst])
+            else:
+                edge_prior = 0.5 * (node_slice[src] + node_slice[dst])
+            self.edge_prior = edge_prior.detach()
+
+            if self.init_with_mask:
+                # 在随机初始化基础上叠加先验偏置，提升优化稳定性
+                edge_mask_init = edge_mask_init + (self.edge_prior - 0.5) * (2.0 * std)
+
+        self.edge_mask = torch.nn.Parameter(edge_mask_init)
+
+        loop_mask = edge_index[0] != edge_index[1]
+        for module in self.model.modules():
+            if isinstance(module, MessagePassing):
+                module.explain = True
+                module._edge_mask = self.edge_mask
+                module._loop_mask = loop_mask
+                module._apply_sigmoid = True
+
+    def __clear_masks__(self):
+        for module in self.model.modules():
+            if isinstance(module, MessagePassing):
+                module.explain = False
+                module._edge_mask = None
+                module._loop_mask = None
+                module._apply_sigmoid = True
+        self.node_feat_mask = None
+        self.edge_mask = None
+
+    def __loss__(self, raw_preds: Tensor, x_label: Union[Tensor, int]) -> Tensor:
+        if isinstance(x_label, torch.Tensor):
+            x_label = int(x_label.item())
+
+        margin = 1.0
+        if self.explain_graph:
+            logits = raw_preds
+            if logits.dim() == 2 and logits.size(0) >= 1:
+                logits = logits[0]
+            pos = logits[x_label]
+            mask = torch.ones_like(logits, dtype=torch.bool)
+            mask[x_label] = False
+            neg = logits[mask].max()
+        else:
+            node_logits = raw_preds[self.node_idx]
+            pos = node_logits[x_label]
+            mask = torch.ones_like(node_logits, dtype=torch.bool)
+            mask[x_label] = False
+            neg = node_logits[mask].max()
+
+        cf_loss = torch.relu(pos - neg + margin)
+        m = self.edge_mask.sigmoid()
+        if self.L1_dist:
+            edge_dist_loss = m.abs().sum()
+        else:
+            edge_dist_loss = F.binary_cross_entropy(m, torch.zeros_like(m, device=m.device))
+
+        total_loss = self.alpha * cf_loss + (1 - self.alpha) * edge_dist_loss
+
+        if self.edge_prior is not None and self.mask_prior_lambda > 0:
+            prior = self.edge_prior.to(m.device)
+            prior_loss = F.binary_cross_entropy(m, prior)
+            total_loss = total_loss + self.mask_prior_lambda * prior_loss
+
+        return total_loss
+
+    def gnn_explainer_alg(self,
+                          x: Tensor,
+                          edge_index: Tensor,
+                          ex_label: Tensor,
+                          mask_features: bool = False,
+                          **kwargs) -> Tensor:
+        self.to(x.device)
+        self.mask_features = mask_features
+        optimizer = torch.optim.Adam([self.node_feat_mask, self.edge_mask], lr=self.lr)
+
+        for epoch in range(1, self.epochs + 1):
+            h = x * self.node_feat_mask.view(1, -1).sigmoid() if mask_features else x
+            raw_preds = self.model(x=h, edge_index=edge_index, **self._model_forward_kwargs(kwargs))
+            loss = self.__loss__(raw_preds, ex_label)
+
+            if epoch % 20 == 0 and debug:
+                print(f'Loss:{loss.item():.6f}')
+
+            optimizer.zero_grad()
+            loss.backward()
+            if self.edge_mask.grad is not None:
+                torch.nn.utils.clip_grad_norm_([self.edge_mask], max_norm=5.0)
+            if mask_features and self.node_feat_mask.grad is not None:
+                torch.nn.utils.clip_grad_norm_([self.node_feat_mask], max_norm=5.0)
+            optimizer.step()
+
+        return self.edge_mask.data
+
+    def forward(self, x, edge_index, mask_features=False, target_label=None, **kwargs):
+        super().forward(x=x, edge_index=edge_index, **kwargs)
+        self.model.eval()
+
+        if self.explain_graph:
+            # 图级解释必须与真实 forward 使用同一 edge_index，避免 edge_mask 与边数量失配
+            self_loop_edge_index = edge_index
+        else:
+            self_loop_edge_index, _ = add_remaining_self_loops(edge_index, num_nodes=self.num_nodes)
+
+        if not self.explain_graph:
+            self.node_idx = node_idx = kwargs.get('node_idx')
+            assert node_idx is not None, 'An node explanation needs kwarg node_idx, but got None.'
+            if isinstance(node_idx, torch.Tensor) and not node_idx.dim():
+                node_idx = node_idx.to(self.device).flatten()
+            elif isinstance(node_idx, (int, list, tuple)):
+                node_idx = torch.tensor([node_idx], device=self.device, dtype=torch.int64).flatten()
+            else:
+                raise TypeError(f'node_idx should be in types of int, list, tuple, or torch.Tensor, but got {type(node_idx)}')
+            self.subset, _, _, self.hard_edge_mask = subgraph(
+                node_idx, self.__num_hops__, self_loop_edge_index, relabel_nodes=True,
+                num_nodes=None, flow=self.__flow__())
+            self.new_node_idx = torch.where(self.subset == node_idx)[0]
+
+        if kwargs.get('edge_masks'):
+            edge_masks = kwargs.pop('edge_masks')
+            self.__set_masks__(x, self_loop_edge_index)
+        else:
+            num_classes = kwargs.get('num_classes')
+            if num_classes is None:
+                num_classes = getattr(self.model, 'num_classes', 2)
+            labels = tuple(i for i in range(num_classes))
+            ex_labels = tuple(torch.tensor([label]).to(self.device) for label in labels)
+
+            edge_masks = []
+            for ex_label in ex_labels:
+                if target_label is None or ex_label.item() == target_label.item():
+                    self.__clear_masks__()
+                    self.__set_masks__(x, self_loop_edge_index)
+                    edge_mask = self.gnn_explainer_alg(x, self_loop_edge_index, ex_label, **kwargs).sigmoid()
+                    if self._symmetric_edge_mask_indirect_graph:
+                        edge_mask = symmetric_edge_mask_indirect_graph(self_loop_edge_index, edge_mask)
+                    edge_masks.append(edge_mask)
+
+        hard_edge_masks = [self.control_sparsity(mask, sparsity=kwargs.get('sparsity'))
+                           for mask in edge_masks]
+        with torch.no_grad():
+            related_preds = self.eval_related_pred(
+                x, self_loop_edge_index, hard_edge_masks, **self._model_forward_kwargs(kwargs)
+            )
+        self.__clear_masks__()
+        return edge_masks, hard_edge_masks, related_preds, self_loop_edge_index
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}()'
 
 def _initialize_with_comprehensive_dummy_data(self):
     """使用更全面的虚拟数据初始化模型"""
