@@ -1116,8 +1116,26 @@ def main():
                 "If this is a new GNN setting, run with --do_train first (or keep --do_train --do_test together) "
                 "to create checkpoint-best-f1/model.bin."
             )
+
         checkpoint_state = torch.load(model_checkpoint_dir, map_location=args.device)
-        load_result = model.load_state_dict(checkpoint_state, strict=False)
+        model_state = model.state_dict()
+        compatible_state = {}
+        skipped_mismatch = []
+        for key, value in checkpoint_state.items():
+            if key not in model_state:
+                continue
+            if model_state[key].shape != value.shape:
+                skipped_mismatch.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+                continue
+            compatible_state[key] = value
+
+        load_result = model.load_state_dict(compatible_state, strict=False)
+        if skipped_mismatch:
+            print(f"[warn] skipped {len(skipped_mismatch)} checkpoint params due to shape mismatch.")
+            for key, ckpt_shape, model_shape in skipped_mismatch[:10]:
+                print(f"[warn] shape mismatch: {key}: ckpt={ckpt_shape}, model={model_shape}")
+            if len(skipped_mismatch) > 10:
+                print(f"[warn] ... and {len(skipped_mismatch) - 10} more mismatched params")
         if load_result.missing_keys:
             print(f"[warn] checkpoint missing keys, using current model defaults: {load_result.missing_keys}")
         if load_result.unexpected_keys:
