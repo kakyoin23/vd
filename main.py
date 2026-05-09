@@ -780,6 +780,8 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
         if prob_pos < getattr(args, "explain_min_prob", 0.0):
             skip_prob += 1
             continue
+        if prob_pos < getattr(args, "explain_min_prob", 0.0):
+            continue
             
         print(f"解释样本: {sampleid}")
         try:
@@ -904,6 +906,8 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
             continue
         if prob_pos < getattr(args, "explain_min_prob", 0.0):
             skip_prob += 1
+            continue
+        if prob_pos < getattr(args, "explain_min_prob", 0.0):
             continue
         print(f"解释样本: {sampleid}")
 
