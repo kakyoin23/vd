@@ -1,7 +1,9 @@
 import os
+import shutil
 import gc
 import json
 import random
+import traceback
 import argparse
 import warnings
 
@@ -189,6 +191,7 @@ def train(args, train_dataloader, valid_dataloader, test_dataloader, model):
     scaler = GradScaler(enabled=(args.device.type == "cuda"))
 
     best_valid_f1 = 0.0
+    saved_best_checkpoint = False
     patience = 10
     patience_counter = 0
     best_epoch = 0
@@ -310,6 +313,7 @@ def train(args, train_dataloader, valid_dataloader, test_dataloader, model):
             output_path = os.path.join(output_dir, '{}'.format('model.bin'))
             torch.save(model_to_save.state_dict(), output_path)
             print(f"Saving best model (valid_f1={valid_f1:.4f}) to {output_path}")
+            saved_best_checkpoint = True
 
         if idx >= min_epochs:
             if is_best:
@@ -324,6 +328,16 @@ def train(args, train_dataloader, valid_dataloader, test_dataloader, model):
         else:
             if not is_best:
                 print(f"Warmup epoch {idx}: F1 did not improve ({valid_f1:.4f} <= {best_valid_f1:.4f})")
+
+    if not saved_best_checkpoint:
+        # 兜底：避免后续 --do_test 阶段因 checkpoint 缺失直接报 FileNotFoundError
+        checkpoint_prefix = 'checkpoint-best-f1'
+        output_dir = os.path.join(args.model_checkpoint_dir, '{}'.format(checkpoint_prefix))
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, 'model.bin')
+        model_to_save = model.module if hasattr(model, 'module') else model
+        torch.save(model_to_save.state_dict(), output_path)
+        print(f"[warn] no improving valid_f1 checkpoint was found; saved final epoch model to {output_path}")
 
     plot_training_curves(train_losses, valid_losses, train_accuracies, valid_accuracies, epochs_list, args.model_checkpoint_dir)
     return global_step, tr_loss / global_step if global_step > 0 else 0
@@ -471,7 +485,7 @@ def calibrate_temperature(args, valid_dataloader, model, T_grid=np.linspace(0.5,
     print(f"[calib] best temperature T={best_T:.3f}")
     return best_T
 
-def gen_exp_lines(edge_index, edge_weight, index, num_nodes, lines):
+def gen_exp_lines(edge_index, edge_weight, index, num_nodes, lines, agg: str = "sum", top_n: int = None, min_line: int = 1):
     temp = torch.zeros_like(edge_weight).to(edge_index.device)
     temp[index] = edge_weight[index]
 
@@ -488,9 +502,28 @@ def gen_exp_lines(edge_index, edge_weight, index, num_nodes, lines):
     line_importance_in = torch.spmm(adj_mask.T, line_importance_init) / in_degree.unsqueeze(-1)
     line_importance = line_importance_out + line_importance_in
 
-    ret = sorted(list(zip(line_importance.squeeze(-1).cpu().numpy(), lines)), reverse=True)
-    filtered_ret = [int(i[1]) for i in ret if i[0] > 0]
-    return filtered_ret
+    raw_scores = line_importance.squeeze(-1).detach().cpu().numpy()
+    line_ids = np.asarray(lines).astype(int)
+
+    # A 方案：行级聚合 + 去重 + 过滤非法行号
+    line2score = {}
+    for s, l in zip(raw_scores, line_ids):
+        if s <= 0:
+            continue
+        if l < min_line:
+            continue
+        if l not in line2score:
+            line2score[l] = float(s)
+        else:
+            if agg == "max":
+                line2score[l] = max(line2score[l], float(s))
+            else:
+                line2score[l] += float(s)
+
+    ranked = sorted(line2score.items(), key=lambda x: x[1], reverse=True)
+    if top_n is not None and top_n > 0:
+        ranked = ranked[:top_n]
+    return [int(line) for line, _ in ranked]
 
 def load_checkpoint_strict(model, checkpoint_path, device):
     checkpoint_state = torch.load(checkpoint_path, map_location=device)
@@ -517,8 +550,14 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
         return
 
     accuracy_cnt = 0
+    evaluated_cnt = 0
+    skipped_no_label_key = 0
+    skipped_empty_gt = 0
     precisions, recalls, F1s, pn = [], [], [], []
+    hit_at_1, hit_at_3, hit_at_5, mrr_scores = [], [], [], []
+    prob_drop_fac, prob_drop_cf = [], []
 
+    warned_legacy_line_index = False
     for graph in graph_exp_list:
         graph.to(args.device)
         x, edge_index = graph.x, graph.edge_index.long()
@@ -543,9 +582,13 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
             continue
 
         if int(sampleid) not in correct_lines:
+            skipped_no_label_key += 1
             continue
 
         exp_label_lines = list(correct_lines[int(sampleid)]["removed"])
+        if len(exp_label_lines) == 0:
+            skipped_empty_gt += 1
+            continue
 
         th = getattr(args, "exp_edge_thresh", -1.0)
         if th >= 0:
@@ -561,17 +604,48 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
             else:
                 index = torch.arange(edge_weight.shape[0])
 
-        if hasattr(graph, 'line_index'):
+        if hasattr(graph, 'line_number'):
+             lines = graph.line_number.cpu().numpy()
+        elif hasattr(graph, 'line_index'):
              lines = graph.line_index.cpu().numpy()
         elif hasattr(graph, '_LINE'):
              lines = graph._LINE.cpu().numpy()
         else:
              lines = np.arange(x.shape[0])
+        lines = np.asarray(lines).astype(int)
+        if (not hasattr(graph, 'line_number')) and (len(lines) > 0) and (int(np.max(lines)) >= 1_000_000) and (not warned_legacy_line_index):
+            print("[warn] detected legacy node-id based line_index (>=1e6). "
+                  "Please rebuild processed dataset to refresh line numbers.")
+            warned_legacy_line_index = True
 
-        exp_lines = gen_exp_lines(edge_index, edge_weight, index, x.shape[0], lines)
+        exp_lines = gen_exp_lines(
+            edge_index,
+            edge_weight,
+            index,
+            x.shape[0],
+            lines,
+            agg=getattr(args, "exp_line_agg", "sum"),
+            top_n=getattr(args, "exp_top_lines", 3),
+            min_line=1,
+        )
+        evaluated_cnt += 1
 
         if any((l in exp_label_lines) for l in exp_lines):
             accuracy_cnt += 1
+
+        # Ranking-quality metrics.
+        top1 = exp_lines[:1]
+        top3 = exp_lines[:3]
+        top5 = exp_lines[:5]
+        hit_at_1.append(float(any(l in exp_label_lines for l in top1)))
+        hit_at_3.append(float(any(l in exp_label_lines for l in top3)))
+        hit_at_5.append(float(any(l in exp_label_lines for l in top5)))
+        rr = 0.0
+        for rank, l in enumerate(exp_lines, start=1):
+            if l in exp_label_lines:
+                rr = 1.0 / float(rank)
+                break
+        mrr_scores.append(rr)
 
         hit = sum(1 for l in exp_lines if l in exp_label_lines)
         if hit > 0 and len(exp_lines) > 0 and len(exp_label_lines) > 0:
@@ -589,6 +663,15 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
         temp[index] = 0
         cf_index = (temp != 0)
 
+        # Base prediction confidence on the full graph.
+        if args.gnn_model_norm in ["RGCN", "RGAT"]:
+            base_logits = model(x, edge_index, batch, edge_types=edge_type)
+        elif args.gnn_model_norm in ["GAT", "Transformer"] and args.use_edge_features and edge_attr is not None:
+            base_logits = model(x, edge_index, batch, edge_attr=edge_attr)
+        else:
+            base_logits = model(x, edge_index, batch)
+        base_prob = F.softmax(base_logits, dim=-1)[0][args.positive_class_id]
+
         fac_edge_index = edge_index[:, index]
         
         # 反事实解释也需要适配 edge_attr / edge_types
@@ -605,6 +688,7 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
             fac_logits = model(x, fac_edge_index, batch)
         
         fac_pred = F.one_hot(torch.argmax(fac_logits, dim=-1), 2)[0][args.positive_class_id]
+        fac_prob = F.softmax(fac_logits, dim=-1)[0][args.positive_class_id]
 
         cf_edge_index = edge_index[:, cf_index]
         if args.gnn_model_norm in ["RGCN", "RGAT"]:
@@ -617,19 +701,30 @@ def eval_exp(exp_saved_path, model, correct_lines, args):
             cf_logits = model(x, cf_edge_index, batch)
 
         cf_pred = F.one_hot(torch.argmax(cf_logits, dim=-1), 2)[0][args.positive_class_id]
+        cf_prob = F.softmax(cf_logits, dim=-1)[0][args.positive_class_id]
 
         pn.append(int(cf_pred != pred))
+        prob_drop_fac.append(float((base_prob - fac_prob).item()))
+        prob_drop_cf.append(float((base_prob - cf_prob).item()))
 
-    N = max(1, len(graph_exp_list))
+    N = max(1, evaluated_cnt)
+    print(f"[eval] evaluated={evaluated_cnt}, skipped_no_label_key={skipped_no_label_key}, skipped_empty_gt={skipped_empty_gt}")
     print("Accuracy:", round(accuracy_cnt / N, 4))
-    print("Precision:", round(float(np.mean(precisions)), 4))
-    print("Recall:", round(float(np.mean(recalls)), 4))
-    print("F1:", round(float(np.mean(F1s)), 4))
+    print("Precision:", round(float(np.mean(precisions)) if len(precisions) else 0.0, 4))
+    print("Recall:", round(float(np.mean(recalls)) if len(recalls) else 0.0, 4))
+    print("F1:", round(float(np.mean(F1s)) if len(F1s) else 0.0, 4))
+    print("Hit@1:", round(float(np.mean(hit_at_1)) if len(hit_at_1) else 0.0, 4))
+    print("Hit@3:", round(float(np.mean(hit_at_3)) if len(hit_at_3) else 0.0, 4))
+    print("Hit@5:", round(float(np.mean(hit_at_5)) if len(hit_at_5) else 0.0, 4))
+    print("MRR:", round(float(np.mean(mrr_scores)) if len(mrr_scores) else 0.0, 4))
     print("Probability of Necessity:", round(float(sum(pn)) / len(pn) if len(pn) else 0.0, 4))
+    print("MeanProbDrop(FactualTopK):", round(float(np.mean(prob_drop_fac)) if len(prob_drop_fac) else 0.0, 4))
+    print("MeanProbDrop(CounterfactualRest):", round(float(np.mean(prob_drop_cf)) if len(prob_drop_cf) else 0.0, 4))
 
 def gnnexplainer_run(args, model, test_dataset, correct_lines):
     graph_exp_list = []
     visited_sampleids = set()
+    error_count = 0
     print(f"Starting GNNExplainer on {len(test_dataset)} test samples")
     
     if args.gnn_model_norm == "GAT":
@@ -666,7 +761,9 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
         else:
             continue
         
-        if sampleid not in correct_lines or sampleid in visited_sampleids: continue
+        if sampleid not in correct_lines or sampleid in visited_sampleids:
+            skip_no_gt_or_dup += 1
+            continue
 
         # 检查长度一致性
         if edge_type is not None and edge_type.shape[0] != edge_index.shape[1]:
@@ -675,8 +772,13 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
         # model 调用需要适配 edge_attr
         prob = model(x, edge_index, batch, edge_attr=edge_attr, edge_types=edge_type)
         exp_prob_label = F.one_hot(torch.argmax(prob, dim=-1), 2)
+        prob_pos = float(F.softmax(prob, dim=-1)[0][args.positive_class_id].item())
         
         if label != args.positive_class_id or prob[0][args.positive_class_id] < prob[0][1 - args.positive_class_id]:
+            skip_label_or_pred += 1
+            continue
+        if prob_pos < getattr(args, "explain_min_prob", 0.0):
+            skip_prob += 1
             continue
             
         print(f"解释样本: {sampleid}")
@@ -706,15 +808,34 @@ def gnnexplainer_run(args, model, test_dataset, correct_lines):
             graph_exp_list.append(graph.detach().clone().cpu())
             visited_sampleids.add(sampleid)
         except Exception as e:
-            print(f"Error processing {sampleid}: {e}")
+            error_count += 1
+            err_type = type(e).__name__
+            print(f"Error processing {sampleid}: [{err_type}] {repr(e)}")
+            if getattr(args, "debug_explain", False) and error_count <= getattr(args, "debug_explain_max_errors", 20):
+                et_shape = tuple(edge_type.shape) if edge_type is not None else None
+                ea_shape = tuple(edge_attr.shape) if edge_attr is not None else None
+                print(
+                    f"[debug][sample={sampleid}] x={tuple(x.shape)} edge_index={tuple(edge_index.shape)} "
+                    f"edge_type={et_shape} edge_attr={ea_shape} label={int(label.item())} "
+                    f"prob_pos={prob_pos:.6f}"
+                )
+                print("[debug][traceback]")
+                print(traceback.format_exc())
             explainer.__clear_masks__()
             continue
 
+    if error_count > 0:
+        print(f"[explain] finished with {error_count} explainer errors; successful explanations={len(graph_exp_list)}")
     return graph_exp_list
 
 def cfexplainer_run(args, model, test_dataset, correct_lines):
     graph_exp_list = []
     visited_sampleids = set()
+    error_count = 0
+    skip_no_edges = 0
+    skip_label_or_pred = 0
+    skip_prob = 0
+    skip_no_gt_or_dup = 0
     model.eval()
     
     # 简单的 dummy 初始化检测
@@ -730,10 +851,21 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
     except Exception as e:
         print(f"Model init check failed (ignorable): {e}")
 
-    explainer = CFExplainer(model=model, explain_graph=True, epochs=args.cfexp_epochs, lr=args.cfexp_lr, alpha=args.cfexp_alpha, L1_dist=args.cfexp_L1)
+    explainer = CFExplainer(
+        model=model,
+        explain_graph=True,
+        epochs=args.cfexp_epochs,
+        lr=args.cfexp_lr,
+        alpha=args.cfexp_alpha,
+        L1_dist=args.cfexp_L1,
+        mask_prior_lambda=args.cfexp_mask_prior_lambda,
+        init_with_mask=args.cfexp_init_with_mask,
+        mask_prior_mode=args.cfexp_mask_prior_mode,
+    )
     explainer.device = args.device
 
     for graph in test_dataset:
+        explainer.__clear_masks__()
         graph.to(args.device)
         x, edge_index, batch = graph.x, graph.edge_index.long(), graph.batch
         
@@ -747,7 +879,9 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
         if edge_attr is not None and args.use_edge_features:
             edge_attr = edge_attr.to(args.device)
 
-        if edge_index.shape[1] == 0: continue
+        if edge_index.shape[1] == 0:
+            skip_no_edges += 1
+            continue
 
         label = graph.y.long()[0]
         
@@ -758,27 +892,77 @@ def cfexplainer_run(args, model, test_dataset, correct_lines):
         else:
             continue
 
-        if sampleid not in correct_lines or sampleid in visited_sampleids: continue
+        if sampleid not in correct_lines or sampleid in visited_sampleids:
+            skip_no_gt_or_dup += 1
+            continue
 
         prob = model(x, edge_index, batch, edge_attr=edge_attr, edge_types=edge_type)
         exp_prob_label = F.one_hot(torch.argmax(prob, dim=-1), 2)
+        prob_pos = float(F.softmax(prob, dim=-1)[0][args.positive_class_id].item())
         if label != args.positive_class_id or prob[0][args.positive_class_id] < prob[0][1 - args.positive_class_id]:
+            skip_label_or_pred += 1
+            continue
+        if prob_pos < getattr(args, "explain_min_prob", 0.0):
+            skip_prob += 1
             continue
         print(f"解释样本: {sampleid}")
 
         try:
-            edge_mask = explainer(x, edge_index)
+            target_label = torch.argmax(prob, dim=-1).detach()
+            exp_edge_type = edge_type
+            if args.gnn_model_norm in ["RGCN", "RGAT"] and edge_type is not None:
+                # RGCN/RGAT 在 explain 模式下会按 relation 分边传播，导致 edge_mask 与分片边数失配。
+                # 解释阶段临时把 relation 折叠到单一类型，避免 MessagePassing 的尺寸断言失败。
+                exp_edge_type = torch.zeros_like(edge_type)
+            edge_mask = explainer(
+                x,
+                edge_index,
+                batch=batch,
+                edge_attr=edge_attr,
+                edge_types=exp_edge_type,
+                num_classes=args.num_classes,
+                target_label=target_label,
+            )
             if isinstance(edge_mask, tuple): edge_mask = edge_mask[0]
-            
-            edge_weight = 1 - edge_mask[torch.argmax(exp_prob_label, dim=-1)]
+
+            if edge_mask is None:
+                raise RuntimeError("CFExplainer returned None edge_mask.")
+            if isinstance(edge_mask, (list, tuple)):
+                pred_idx = int(torch.argmax(exp_prob_label, dim=-1).item())
+                edge_weight = edge_mask[0] if len(edge_mask) == 1 else edge_mask[pred_idx]
+            else:
+                edge_weight = edge_mask
+
+            edge_weight = 1 - edge_weight
             graph.__setitem__("edge_weight", torch.Tensor(edge_weight.detach().cpu()))
             graph.__setitem__("pred", exp_prob_label[0][args.positive_class_id])
             graph_exp_list.append(graph.detach().clone().cpu())
             visited_sampleids.add(sampleid)
         except Exception as e:
-            print(f"Error {sampleid}: {e}")
+            error_count += 1
+            err_type = type(e).__name__
+            print(f"Error {sampleid}: [{err_type}] {repr(e)}")
+            if getattr(args, "debug_explain", False) and error_count <= getattr(args, "debug_explain_max_errors", 20):
+                et_shape = tuple(edge_type.shape) if edge_type is not None else None
+                ea_shape = tuple(edge_attr.shape) if edge_attr is not None else None
+                print(
+                    f"[debug][sample={sampleid}] x={tuple(x.shape)} edge_index={tuple(edge_index.shape)} "
+                    f"edge_type={et_shape} edge_attr={ea_shape} label={int(label.item())} "
+                    f"prob_pos={prob_pos:.6f}"
+                )
+                print("[debug][traceback]")
+                print(traceback.format_exc())
+            explainer.__clear_masks__()
             continue
 
+    print(
+        f"[explain][cf] summary: success={len(graph_exp_list)}, errors={error_count}, "
+        f"skip_no_edges={skip_no_edges}, skip_no_gt_or_dup={skip_no_gt_or_dup}, "
+        f"skip_label_or_pred={skip_label_or_pred}, skip_prob={skip_prob}"
+    )
+    if len(graph_exp_list) == 0:
+        print("[warn] CFExplainer produced 0 explanations. Common causes: checkpoint/model mismatch, "
+              "model predicts few/no positive samples, or explain_min_prob too high.")
     return graph_exp_list
 
 def main():
@@ -854,6 +1038,9 @@ def main():
     parser.add_argument('--overwrite_explain', action='store_true')
     parser.add_argument('--cfexp_epochs', type=int, default=800)
     parser.add_argument('--cfexp_lr', type=float, default=5e-2)
+    parser.add_argument('--cfexp_mask_prior_lambda', type=float, default=0.2, help='Weight of slice-mask prior loss in CFExplainer.')
+    parser.add_argument('--cfexp_mask_prior_mode', type=str, default='mean', choices=['mean', 'max', 'prod'], help='How to derive edge prior from endpoint slice masks.')
+    parser.add_argument('--cfexp_init_with_mask', action='store_true', help='Initialize CFExplainer edge mask with slice-mask prior.')
     parser.add_argument('--explain_cache_tag', type=str, default='')
     parser.add_argument('--exp_edge_thresh', type=float, default=-1.0)
 
@@ -868,6 +1055,7 @@ def main():
     
     parser.add_argument('--exp_top_lines', type=int, default=3)
     parser.add_argument('--exp_line_agg', type=str, default='sum', choices=['sum', 'max'])
+    parser.add_argument('--explain_min_prob', type=float, default=0.0, help='Only explain positive samples with predicted positive probability >= this threshold.')
     
     parser.add_argument("--gnnexplainer_epochs", default=1000, type=int)
     parser.add_argument("--gnnexplainer_lr", default=0.05, type=float)
@@ -876,6 +1064,10 @@ def main():
 
     parser.add_argument("--mask_mode", default="aligned", type=str, choices=["aligned", "all_ones", "random"])
     parser.add_argument("--mask_seed", default=42, type=int)
+    parser.add_argument("--rebuild_processed", action='store_true', help="Force remove and rebuild processed graph dataset cache.")
+    parser.add_argument("--debug_explain", action='store_true', help="Print detailed traceback/context for explainer failures.")
+    parser.add_argument("--debug_explain_max_errors", type=int, default=20, help="Max number of detailed explainer errors to print.")
+    parser.add_argument('--allow_partial_checkpoint', action='store_true', help='Allow test/explain to continue when checkpoint/model parameter compatibility is low.')
 
     args = parser.parse_args()
     args.gnn_model_norm = normalize_gnn_model_name(args.gnn_model)
@@ -900,6 +1092,22 @@ def main():
         else:
             suffix = f"_{args.mask_mode}"
         return str(utils.processed_dir() / "vul_graph_dataset" / f"{partition}_processed_target{suffix}" / "data.pt")
+    
+    def _dataset_processed_dir(partition: str) -> str:
+        if args.mask_mode == "aligned":
+            suffix = ""
+        elif args.mask_mode == "random":
+            suffix = f"_random_{args.mask_seed}"
+        else:
+            suffix = f"_{args.mask_mode}"
+        return str(utils.processed_dir() / "vul_graph_dataset" / f"{partition}_processed_target{suffix}")
+
+    if args.rebuild_processed:
+        for p in ["train", "val", "test"]:
+            proc_dir = _dataset_processed_dir(p)
+            if os.path.exists(proc_dir):
+                print(f"[cache] removing processed dataset dir: {proc_dir}")
+                shutil.rmtree(proc_dir)
 
     encoder = None
     tokenizer = None
@@ -927,6 +1135,23 @@ def main():
     test_dataset = VulGraphDataset(root=str(utils.processed_dir() / "vul_graph_dataset"), partition='test', mask_mode=args.mask_mode, mask_seed=args.mask_seed, encoder=encoder, tokenizer=tokenizer)
     test_dataloader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate, num_workers=4, pin_memory=True)
 
+    def _check_line_number_sanity(dataset, name: str):
+        if len(dataset) == 0:
+            return
+        g = dataset[0]
+        lines = None
+        if hasattr(g, 'line_number'):
+            lines = g.line_number.cpu().numpy()
+        elif hasattr(g, 'line_index'):
+            lines = g.line_index.cpu().numpy()
+        if lines is not None and len(lines) > 0 and int(np.max(lines)) >= 1_000_000:
+            print(f"[warn] {name} appears to contain legacy node-id line metadata (max line={int(np.max(lines))}). "
+                  "Use --rebuild_processed to regenerate cached dataset with real source line numbers.")
+
+    _check_line_number_sanity(train_dataset, "train_dataset")
+    _check_line_number_sanity(valid_dataset, "valid_dataset")
+    _check_line_number_sanity(test_dataset, "test_dataset")
+
     check_dataset_stats(train_dataloader, "Training")
     check_dataset_stats(valid_dataloader, "Validation")
     check_dataset_stats(test_dataloader, "Test")
@@ -941,12 +1166,49 @@ def main():
     if args.do_test:
         checkpoint_prefix = 'checkpoint-best-f1/model.bin'
         model_checkpoint_dir = os.path.join(args.model_checkpoint_dir, '{}'.format(checkpoint_prefix))
+        if not os.path.exists(model_checkpoint_dir):
+            raise FileNotFoundError(
+                f"Checkpoint not found: {model_checkpoint_dir}. "
+                "If this is a new GNN setting, run with --do_train first (or keep --do_train --do_test together) "
+                "to create checkpoint-best-f1/model.bin."
+            )
+
         checkpoint_state = torch.load(model_checkpoint_dir, map_location=args.device)
-        load_result = model.load_state_dict(checkpoint_state, strict=False)
+        model_state = model.state_dict()
+        compatible_state = {}
+        skipped_mismatch = []
+        for key, value in checkpoint_state.items():
+            if key not in model_state:
+                continue
+            if model_state[key].shape != value.shape:
+                skipped_mismatch.append((key, tuple(value.shape), tuple(model_state[key].shape)))
+                continue
+            compatible_state[key] = value
+
+        load_result = model.load_state_dict(compatible_state, strict=False)
+        if skipped_mismatch:
+            print(f"[warn] skipped {len(skipped_mismatch)} checkpoint params due to shape mismatch.")
+            for key, ckpt_shape, model_shape in skipped_mismatch[:10]:
+                print(f"[warn] shape mismatch: {key}: ckpt={ckpt_shape}, model={model_shape}")
+            if len(skipped_mismatch) > 10:
+                print(f"[warn] ... and {len(skipped_mismatch) - 10} more mismatched params")
         if load_result.missing_keys:
             print(f"[warn] checkpoint missing keys, using current model defaults: {load_result.missing_keys}")
         if load_result.unexpected_keys:
             print(f"[warn] checkpoint has unexpected keys that were ignored: {load_result.unexpected_keys}")
+
+        model_param_keys = set(model_state.keys())
+        loaded_param_keys = set(compatible_state.keys())
+        loaded_ratio = (len(loaded_param_keys) / max(1, len(model_param_keys)))
+        print(f"[checkpoint] loaded compatible params: {len(loaded_param_keys)}/{len(model_param_keys)} (ratio={loaded_ratio:.2%})")
+        if loaded_ratio < 0.80 and (not getattr(args, 'allow_partial_checkpoint', False)):
+            raise RuntimeError(
+                "Checkpoint compatibility is too low (<80%). This usually means you are loading a checkpoint "
+                "from a different model/layout (e.g., different backbone or classifier width). "
+                "Please retrain this configuration with --do_train, or rerun with --allow_partial_checkpoint "
+                "if you intentionally want partial loading."
+            )
+
         model.to(args.device)
 
         if getattr(args, "calibrate_temp", False):
@@ -972,7 +1234,7 @@ def main():
             tag = f"_tag{args.explain_cache_tag}" if getattr(args, "explain_cache_tag", "") else ""
             ipt_save = os.path.join(
                 explain_dir,
-                f"{args.gnn_model}_{args.graph_pooling}_{args.ipt_method}_{args.KM}.pt"
+                f"{args.gnn_model}_{args.graph_pooling}_{args.ipt_method}_{args.KM}{tag}.pt"
             )
 
             print("Size of test dataset:", len(test_dataset))
